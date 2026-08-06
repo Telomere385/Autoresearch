@@ -194,7 +194,7 @@ def main():
                     sys.argv = old_argv
 
                 result = flappyq.run_configured_experiment(config, args.mode, run_dir)
-                result["status"] = "ok"
+                result["status"] = "success"
                 result["seed"] = config["seed"]
                 result["hyperparameters"] = extract_hyperparameters(config)
                 result["result_path"] = str(result_path)
