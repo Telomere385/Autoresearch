@@ -1,11 +1,13 @@
 import numpy as np
 import matplotlib.pyplot as plt
+from pathlib import Path
 
+DATA_DIR = Path(__file__).resolve().parents[1] / "data"
 
-r1 = np.load("ave_reward_lr_0.1.npy")
-r2 = np.load("ave_reward_lr_0.4.npy")
-r3 = np.load("ave_reward_lr_0.6.npy")
-r4 = np.load("ave_reward_lr_0.9.npy")
+r1 = np.load(DATA_DIR / "rewards" / "ave_reward_lr_0.1.npy")
+r2 = np.load(DATA_DIR / "rewards" / "ave_reward_lr_0.4.npy")
+r3 = np.load(DATA_DIR / "rewards" / "ave_reward_lr_0.6.npy")
+r4 = np.load(DATA_DIR / "rewards" / "ave_reward_lr_0.9.npy")
 
 
 # episodes1 = np.arange(1, len(r1) + 1)

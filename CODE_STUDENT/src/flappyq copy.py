@@ -1,8 +1,9 @@
 from itertools import cycle
-from mip_noise import solve
+from pathlib import Path
 import random
 import sys
 import numpy as np
+from sys import argv
 
 import pygame
 from pygame.locals import *
@@ -15,39 +16,125 @@ PIPEGAPSIZE  = 100 # gap between upper and lower part of pipe
 BASEY        = SCREENHEIGHT * 0.79
 # image, sound and hitmask  dicts
 IMAGES, SOUNDS, HITMASKS = {}, {}, {}
+BASE_DIR = Path(__file__).resolve().parents[1]
+DATA_DIR = BASE_DIR / 'data'
+
+
+def asset_path(relative_path):
+    return str(BASE_DIR / relative_path)
+
+
+def data_path(*parts):
+    return str(DATA_DIR.joinpath(*parts))
+
+
+def input_path(path):
+    path = Path(path)
+    if path.is_absolute() or path.exists():
+        return str(path)
+    q_table_path = DATA_DIR / 'q_tables' / path
+    if q_table_path.exists():
+        return str(q_table_path)
+    return str(BASE_DIR / path)
+
+PIPEGAPSIZE  = 100 # gap between upper and lower pipe
+PIPEWIDTH = 52
+BIRDWIDTH = 34
+BIRDHEIGHT = 24
+BIRDDIAMETER = np.sqrt(BIRDHEIGHT**2 + BIRDWIDTH**2) # the bird rotates in the game, so we use it's maximum extent
+SKY = 0 # location of sky
+GROUND = (512*0.79)-1 # location of ground
+PLAYERX = 57 # location of bird
+
+reward = 0
+olddx = 0
+olddy = 0
+oldvy = 0
+oldflap = 0
+
+counter = 0
+rewsum = 0
+
+highscore = 0
+totscore = 0
+
+screen = True 
+episode_rewards = []  # 用来存每一局的总reward #Plot
+ave_rewards = [] #Plot
+
+
+
+if(len(argv)) == 2:
+    if argv[1] == 'play':
+        Q = np.load(data_path('q_tables', 'Q_last_lr_0.6.npy'))
+        FPS = 30
+        screen = True
+    elif argv[1] == 'train':
+        Q = np.load(data_path('q_tables', 'Qvals.npy')) 
+        FPS = 1500
+        screen = False
+        print('Starting to train!')
+    else:
+        print('Invalid command line arguments. The first one should be either \'train\' or \'play\'!')
+        print('If you want to load a specific Q matrix, the second one should be a filename.')
+        exit()
+elif(len(argv)) == 3:
+    if argv[1] == 'play' and isinstance(argv[2], str):
+        FPS = 30
+        screen = True
+        try:
+            Q = np.load(input_path(argv[2]))
+        except:
+            print('Failed loading file!')
+            exit()
+    elif argv[1] == 'train' and isinstance(argv[2], str):
+        FPS = 1500
+        screen = False
+        try:
+            Q = np.load(input_path(argv[2]))
+        except:
+            print('Failed loading file!')
+            exit()
+        print('Starting to train!')
+    else:
+        print('Invalid command line arguments. The first one should be either \'train\' or \'play\'!')
+        print('If you want to load a specific Q matrix, the second one should be a filename.')
+        exit()
+
+
 
 # list of all possible players (tuple of 3 positions of flap)
 PLAYERS_LIST = (
     # red bird
     (
-        'assets/sprites/redbird-upflap.png',
-        'assets/sprites/redbird-midflap.png',
-        'assets/sprites/redbird-downflap.png',
+        asset_path('assets/sprites/redbird-upflap.png'),
+        asset_path('assets/sprites/redbird-midflap.png'),
+        asset_path('assets/sprites/redbird-downflap.png'),
     ),
     # blue bird
     (
-        'assets/sprites/bluebird-upflap.png',
-        'assets/sprites/bluebird-midflap.png',
-        'assets/sprites/bluebird-downflap.png',
+        asset_path('assets/sprites/bluebird-upflap.png'),
+        asset_path('assets/sprites/bluebird-midflap.png'),
+        asset_path('assets/sprites/bluebird-downflap.png'),
     ),
     # yellow bird
     (
-        'assets/sprites/yellowbird-upflap.png',
-        'assets/sprites/yellowbird-midflap.png',
-        'assets/sprites/yellowbird-downflap.png',
+        asset_path('assets/sprites/yellowbird-upflap.png'),
+        asset_path('assets/sprites/yellowbird-midflap.png'),
+        asset_path('assets/sprites/yellowbird-downflap.png'),
     ),
 )
 
 # list of backgrounds
 BACKGROUNDS_LIST = (
-    'assets/sprites/background-day.png',
-    'assets/sprites/background-night.png',
+    asset_path('assets/sprites/background-day.png'),
+    asset_path('assets/sprites/background-night.png'),
 )
 
 # list of pipes
 PIPES_LIST = (
-    'assets/sprites/pipe-green.png',
-    'assets/sprites/pipe-red.png',
+    asset_path('assets/sprites/pipe-green.png'),
+    asset_path('assets/sprites/pipe-red.png'),
 )
 
 
@@ -57,7 +144,11 @@ except NameError:
     xrange = range
 
 
+
+
+
 def main():
+
     global SCREEN, FPSCLOCK
     pygame.init()
     FPSCLOCK = pygame.time.Clock()
@@ -66,24 +157,24 @@ def main():
 
     # numbers sprites for score display
     IMAGES['numbers'] = (
-        pygame.image.load('assets/sprites/0.png').convert_alpha(),
-        pygame.image.load('assets/sprites/1.png').convert_alpha(),
-        pygame.image.load('assets/sprites/2.png').convert_alpha(),
-        pygame.image.load('assets/sprites/3.png').convert_alpha(),
-        pygame.image.load('assets/sprites/4.png').convert_alpha(),
-        pygame.image.load('assets/sprites/5.png').convert_alpha(),
-        pygame.image.load('assets/sprites/6.png').convert_alpha(),
-        pygame.image.load('assets/sprites/7.png').convert_alpha(),
-        pygame.image.load('assets/sprites/8.png').convert_alpha(),
-        pygame.image.load('assets/sprites/9.png').convert_alpha()
+        pygame.image.load(asset_path('assets/sprites/0.png')).convert_alpha(),
+        pygame.image.load(asset_path('assets/sprites/1.png')).convert_alpha(),
+        pygame.image.load(asset_path('assets/sprites/2.png')).convert_alpha(),
+        pygame.image.load(asset_path('assets/sprites/3.png')).convert_alpha(),
+        pygame.image.load(asset_path('assets/sprites/4.png')).convert_alpha(),
+        pygame.image.load(asset_path('assets/sprites/5.png')).convert_alpha(),
+        pygame.image.load(asset_path('assets/sprites/6.png')).convert_alpha(),
+        pygame.image.load(asset_path('assets/sprites/7.png')).convert_alpha(),
+        pygame.image.load(asset_path('assets/sprites/8.png')).convert_alpha(),
+        pygame.image.load(asset_path('assets/sprites/9.png')).convert_alpha()
     )
 
     # game over sprite
-    IMAGES['gameover'] = pygame.image.load('assets/sprites/gameover.png').convert_alpha()
+    IMAGES['gameover'] = pygame.image.load(asset_path('assets/sprites/gameover.png')).convert_alpha()
     # message sprite for welcome screen
-    IMAGES['message'] = pygame.image.load('assets/sprites/message.png').convert_alpha()
+    IMAGES['message'] = pygame.image.load(asset_path('assets/sprites/message.png')).convert_alpha()
     # base (ground) sprite
-    IMAGES['base'] = pygame.image.load('assets/sprites/base.png').convert_alpha()
+    IMAGES['base'] = pygame.image.load(asset_path('assets/sprites/base.png')).convert_alpha()
 
     # sounds
     if 'win' in sys.platform:
@@ -91,13 +182,15 @@ def main():
     else:
         soundExt = '.ogg'
 
-    SOUNDS['die']    = pygame.mixer.Sound('assets/audio/die' + soundExt)
-    SOUNDS['hit']    = pygame.mixer.Sound('assets/audio/hit' + soundExt)
-    SOUNDS['point']  = pygame.mixer.Sound('assets/audio/point' + soundExt)
-    SOUNDS['swoosh'] = pygame.mixer.Sound('assets/audio/swoosh' + soundExt)
-    SOUNDS['wing']   = pygame.mixer.Sound('assets/audio/wing' + soundExt)
+    SOUNDS['die']    = pygame.mixer.Sound(asset_path('assets/audio/die' + soundExt))
+    SOUNDS['hit']    = pygame.mixer.Sound(asset_path('assets/audio/hit' + soundExt))
+    SOUNDS['point']  = pygame.mixer.Sound(asset_path('assets/audio/point' + soundExt))
+    SOUNDS['swoosh'] = pygame.mixer.Sound(asset_path('assets/audio/swoosh' + soundExt))
+    SOUNDS['wing']   = pygame.mixer.Sound(asset_path('assets/audio/wing' + soundExt))
 
-    while True:
+    MAX_EPISODES = 5000 #3.3.2
+    while counter < MAX_EPISODES:
+    # while True:
         # select random background sprites
         randBg = random.randint(0, len(BACKGROUNDS_LIST) - 1)
         IMAGES['background'] = pygame.image.load(BACKGROUNDS_LIST[randBg]).convert()
@@ -162,14 +255,15 @@ def showWelcomeAnimation():
             if event.type == QUIT or (event.type == KEYDOWN and event.key == K_ESCAPE):
                 pygame.quit()
                 sys.exit()
-            if event.type == KEYDOWN and (event.key == K_SPACE or event.key == K_UP):
-                # make first flap sound and return values for mainGame
-                SOUNDS['wing'].play()
-                return {
-                    'playery': playery + playerShmVals['val'],
-                    'basex': basex,
-                    'playerIndexGen': playerIndexGen,
-                }
+            #if event.type == KEYDOWN and (event.key == K_SPACE or event.key == K_UP):
+        if True:
+            # make first flap sound and return values for mainGame
+            # SOUNDS['wing'].play()
+            return {
+                'playery': playery + playerShmVals['val'],
+                'basex': basex,
+                'playerIndexGen': playerIndexGen,
+            }
 
         # adjust playery, playerIndex, basex
         if (loopIter + 1) % 5 == 0:
@@ -190,7 +284,12 @@ def showWelcomeAnimation():
 
 
 def mainGame(movementInfo):
+    global olddx, olddy, oldvy, oldflap, reward
+    global counter, rewsum, highscore, totscore
+    global screen
+
     score = playerIndex = loopIter = 0
+    episode_reward = 0 #Plot
     playerIndexGen = movementInfo['playerIndexGen']
     playerx, playery = int(SCREENWIDTH * 0.2), movementInfo['playery']
 
@@ -223,11 +322,16 @@ def mainGame(movementInfo):
     playerRot     =  45   # player's rotation
     playerVelRot  =   3   # angular speed
     playerRotThr  =  20   # rotation threshold
-    playerFlapAcc =  -14   # players speed on flapping
+    #playerFlapAcc =  -14   # players speed on flapping
+    playerFlapAcc =  -10  # players speed on flapping
     playerFlapped = False # True when player flaps
 
 
     while True:
+
+        rewsum += reward
+        episode_reward += reward #Plot
+
         for event in pygame.event.get():
             if event.type == QUIT or (event.type == KEYDOWN and event.key == K_ESCAPE):
                 pygame.quit()
@@ -237,25 +341,141 @@ def mainGame(movementInfo):
                 if playery > -2 * IMAGES['player'][0].get_height():
                     playerVelY += playerFlapAcc
                     playerFlapped = True
-                    SOUNDS['wing'].play()
-            
-        G = 1
 
-        if loopIter % 5 == 0:
-            G += 0.1*np.random.normal()
+        traj = [(0,0), (0,0)]
 
-        flap, traj = solve(playery, playerVelY, lowerPipes, G)
+        y = playery
+        vy = playerVelY
+
+
+        ##############################################################################
+        ##############################################################################
+        ##############################################################################
+        #                      interesting code begins here                          #
+        ##############################################################################
+        ##############################################################################
+        ##############################################################################
+
+
+
+        # Measuring distance to the next pipe
+
+        # dx is the x-axis distance from the player to the center of the nearest pipe
+        # we first assume that pipe 0 is the closest
+        dx = lowerPipes[0]['x'] - PLAYERX
+        if dx < 0:
+            # if we've passed pipe 0, pipe 1 actually the one we want to look at
+            dx = lowerPipes[1]['x'] - PLAYERX
+
+            # and we want to look at the y-axis distance from the pipe as well
+            dy = lowerPipes[1]['y'] - (PIPEGAPSIZE//2) - (BIRDDIAMETER//2) - y 
+        else:
+            # this branch gives us the y-axis distance for pipe 0
+            dy = lowerPipes[0]['y'] - (PIPEGAPSIZE//2) - (BIRDDIAMETER//2) - y
+
+        dy = int(dy)
+        dx = int(dx)
+
+        # rewards
+        pipePassedReward = 10
+        didNotDieReward = 0.05
+        dieReward = -50
+
+
+        # loopIter is a frame counter going from 0 to 30, and then resetting
+        # every now and then, we want to take an action
+        # this might be every frame, might be every 15 frames...
+        sampleT = 3
+
+        if loopIter % sampleT == 0:
+
+            # ni is the learning rate
+            # ni = 0.4
+            ni = max(0.1, 0.6 * (0.999 ** counter))
+            # ni = max(0.1, 0.7 * (0.999 ** counter))
+            # ni = max(0.1, 0.4 * (0.999 ** counter))
+            # ni = max(0.1, 0.9 * (0.999 ** counter))
+            # r is the discretisation rate for (dx, dy)
+            r = 25
+            # rv is the discretisation rate for vy
+            rv = 2
+
+            # s_t represents the last state we were in
+            # s_tp is the state we're in now (the one we want to max over)
+            s_t =  (olddx//r, (olddy + 512)//r, (oldvy + 50)//rv, int(oldflap))
+            s_tp = (dx//r   , (dy + 512)//r   , (vy + 50)//rv)
+
+            # Q update equation
+            Q[s_t] = (1 - ni)*Q[s_t] + ni*(reward + 0.95*np.max(Q[s_tp]))
+
+            # epsilon-greedy step
+            eps = 0.001
+            if np.random.random() <= eps:
+                flap = np.random.choice([True, False])
+            else:
+                flap = bool(np.argmax(Q[s_tp]))
+
+
+            # reset the reward
+            reward = 0
+
+            # save the state info for the next loop
+            olddx = dx
+            olddy = dy
+            oldvy = vy
+            oldflap = int(flap)
+        else:
+            flap = False
+
+
+
+        ##############################################################################
+        ##############################################################################
+        ##############################################################################
+        #                      interesting code ends here                            #
+        ##############################################################################
+        ##############################################################################
+        ##############################################################################
 
 
         if flap:
             playerVelY += playerFlapAcc
             playerFlapped = True
-            SOUNDS['wing'].play()
 
         # check for crash here
         crashTest = checkCrash({'x': playerx, 'y': playery, 'index': playerIndex},
                                upperPipes, lowerPipes)
+
+         
         if crashTest[0]:
+            reward += dieReward
+            episode_reward += dieReward #Plot
+
+            episode_rewards.append(episode_reward) #Plot
+
+            counter += 1
+            if counter % 100 == 0:
+                print("_________________________________________________")
+                print("Round", counter)
+                print("Average reward in last 100 runs:", rewsum/100)
+                print("Nonzero Q values", np.count_nonzero(Q))
+                print("Avg score, high score:", totscore/100, highscore)
+
+                avg100 = rewsum / 100
+                ave_rewards.append(avg100)
+                (DATA_DIR / 'rewards').mkdir(parents=True, exist_ok=True)
+                (DATA_DIR / 'q_tables').mkdir(parents=True, exist_ok=True)
+                np.save(data_path('rewards', 'ave_reward.npy'), np.array(ave_rewards, dtype=float))
+
+                rewsum = 0
+                highscore = 0
+                totscore = 0
+                
+                np.save(data_path('q_tables', 'Q_last.npy'), Q)
+                np.save(data_path('rewards', 'rewards.npy'), np.array(episode_rewards, dtype=float)) #Plot #save_rewards
+                
+                print('Saved progress in data/q_tables and data/rewards')
+
             return {
                 'y': playery,
                 'groundCrash': crashTest[1],
@@ -273,8 +493,15 @@ def mainGame(movementInfo):
             pipeMidPos = pipe['x'] + IMAGES['pipe'][0].get_width() / 2
             if pipeMidPos <= playerMidPos < pipeMidPos + 4:
                 score += 1
-                print(score)
-                SOUNDS['point'].play()
+                reward += pipePassedReward
+
+                totscore += 1
+                if score > highscore:
+                    highscore = score
+                # SOUNDS['point'].play()
+            else:
+                reward += didNotDieReward
+
 
         # playerIndex basex change
         if (loopIter + 1) % 3 == 0:
@@ -315,13 +542,18 @@ def mainGame(movementInfo):
             lowerPipes.pop(0)
 
         # draw sprites
-        SCREEN.blit(IMAGES['background'], (0,0))
+        # hello
+        if screen:
+            SCREEN.blit(IMAGES['background'], (0,0))
 
         for uPipe, lPipe in zip(upperPipes, lowerPipes):
             SCREEN.blit(IMAGES['pipe'][0], (uPipe['x'], uPipe['y']))
             SCREEN.blit(IMAGES['pipe'][1], (lPipe['x'], lPipe['y']))
 
-        SCREEN.blit(IMAGES['base'], (basex, BASEY))
+
+        # hello
+        if screen:
+            SCREEN.blit(IMAGES['base'], (basex, BASEY))
         # print score so player overlaps the score
         showScore(score)
 
@@ -338,8 +570,10 @@ def mainGame(movementInfo):
         playerOffsetX = IMAGES['player'][0].get_width() / 2
         playerOffsetY = IMAGES['player'][0].get_height() / 2
 
-        pygame.draw.lines(SCREEN, (255,0,0), False, [(x+playerOffsetX,y+playerOffsetY) for (x,y) in traj], 3)
-        pygame.display.update()
+        # hello
+        if screen:
+            pygame.draw.lines(SCREEN, (255,0,0), False, [(x+playerOffsetX,y+playerOffsetY) for (x,y) in traj], 3)
+            pygame.display.update()
         FPSCLOCK.tick(FPS)
 
 
@@ -359,18 +593,19 @@ def showGameOverScreen(crashInfo):
     upperPipes, lowerPipes = crashInfo['upperPipes'], crashInfo['lowerPipes']
 
     # play hit and die sounds
-    SOUNDS['hit'].play()
-    if not crashInfo['groundCrash']:
-        SOUNDS['die'].play()
+    #SOUNDS['hit'].play()
+    #if not crashInfo['groundCrash']:
+    #    SOUNDS['die'].play()
 
     while True:
         for event in pygame.event.get():
             if event.type == QUIT or (event.type == KEYDOWN and event.key == K_ESCAPE):
                 pygame.quit()
                 sys.exit()
-            if event.type == KEYDOWN and (event.key == K_SPACE or event.key == K_UP):
-                if playery + playerHeight >= BASEY - 1:
-                    return
+            #if event.type == KEYDOWN and (event.key == K_SPACE or event.key == K_UP):
+        if True:
+            if playery + playerHeight >= BASEY - 1:
+                return
 
         # player y shift
         if playery + playerHeight < BASEY - 1:
@@ -386,24 +621,24 @@ def showGameOverScreen(crashInfo):
                 playerRot -= playerVelRot
 
         # draw sprites
-        SCREEN.blit(IMAGES['background'], (0,0))
+        #SCREEN.blit(IMAGES['background'], (0,0))
 
-        for uPipe, lPipe in zip(upperPipes, lowerPipes):
-            SCREEN.blit(IMAGES['pipe'][0], (uPipe['x'], uPipe['y']))
-            SCREEN.blit(IMAGES['pipe'][1], (lPipe['x'], lPipe['y']))
+        #for uPipe, lPipe in zip(upperPipes, lowerPipes):
+        #    SCREEN.blit(IMAGES['pipe'][0], (uPipe['x'], uPipe['y']))
+        #    SCREEN.blit(IMAGES['pipe'][1], (lPipe['x'], lPipe['y']))
 
-        SCREEN.blit(IMAGES['base'], (basex, BASEY))
-        showScore(score)
+        #SCREEN.blit(IMAGES['base'], (basex, BASEY))
+        #showScore(score)
 
         
 
 
-        playerSurface = pygame.transform.rotate(IMAGES['player'][1], playerRot)
-        SCREEN.blit(playerSurface, (playerx,playery))
-        SCREEN.blit(IMAGES['gameover'], (50, 180))
+        #playerSurface = pygame.transform.rotate(IMAGES['player'][1], playerRot)
+        #SCREEN.blit(playerSurface, (playerx,playery))
+        #SCREEN.blit(IMAGES['gameover'], (50, 180))
 
-        FPSCLOCK.tick(FPS)
-        pygame.display.update()
+        #FPSCLOCK.tick(FPS)
+        #pygame.display.update()
 
 
 def playerShm(playerShm):
@@ -421,6 +656,7 @@ def getRandomPipe():
     """returns a randomly generated pipe"""
     # y of gap between upper and lower pipe
     gapY = random.randrange(0, int(BASEY * 0.6 - PIPEGAPSIZE))
+    #gapY = random.randrange(int(BASEY * 0.5 - PIPEGAPSIZE), int(BASEY * 0.6 - PIPEGAPSIZE))
     gapY += int(BASEY * 0.2)
     pipeHeight = IMAGES['pipe'][0].get_height()
     pipeX = SCREENWIDTH + 10
@@ -452,7 +688,7 @@ def checkCrash(player, upperPipes, lowerPipes):
     player['w'] = IMAGES['player'][0].get_width()
     player['h'] = IMAGES['player'][0].get_height()
 
-    # if player crashes into ground
+    # if player crashes into ground or ceiling
     if player['y'] + player['h'] >= BASEY - 1 or player['y'] + player['h'] <= 0:
         return [True, True]
     else:

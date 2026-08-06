@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+*$py.class
+
+.DS_Store
+*.log
+
+# Local training outputs and ad-hoc copies.
+* copy.npy
+rewards.npy
+ave_reward.npy
+
+runs/*
+!runs/.gitkeep

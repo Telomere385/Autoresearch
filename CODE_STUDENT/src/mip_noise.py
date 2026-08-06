@@ -50,6 +50,7 @@ def solve(playery, playerVelY, lowerPipes, playerAccY):
 
     x = PLAYERX
     xs = [x] 
+    cost = 0
 
     # look ahead
     for t in range(N-1):
@@ -66,13 +67,14 @@ def solve(playery, playerVelY, lowerPipes, playerAccY):
         # distance from the center of the pipe-gap is stored in the dist variable
         pipe_c, dist = getPipeConstraintsDistance(x, y[t+1], lowerPipes)
         c += pipe_c
+        cost += dist
 
 
     #############################################
     ### this is where you enter the objective ###
     #############################################
 
-    objective = cvx.Minimize( ??? )
+    objective = cvx.Minimize(cost)
 
 
 

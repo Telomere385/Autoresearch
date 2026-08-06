@@ -1,8 +1,11 @@
 import os
 import sys
+from pathlib import Path
 from distutils.core import setup
 
 import py2exe
+
+BASE_DIR = Path(__file__).resolve().parent
 
 origIsSystemDLL = py2exe.build_exe.isSystemDLL
 def isSystemDLL(pathname):
@@ -26,9 +29,9 @@ setup(
     },
 
     windows = [{
-        'script': "flappy.py",
+        'script': str(BASE_DIR / "src" / "flappy.py"),
         'icon_resources': [
-            (1, 'flappy.ico')
+            (1, str(BASE_DIR / 'media' / 'flappy.ico'))
         ]
     }],
 

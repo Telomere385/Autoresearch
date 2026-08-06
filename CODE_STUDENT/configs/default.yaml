@@ -1,0 +1,33 @@
+seed: 0
+render: false
+
+training_episodes: 1000
+evaluation_episodes: 100
+save_every: 100
+
+input_q_table: data/q_tables/Qvals.npy
+q_init: heuristic
+
+fps_train: 1500
+fps_eval: 1500
+
+learning_rate: 0.6
+learning_rate_min: 0.1
+learning_rate_decay: 0.9995
+discount_factor: 0.95
+
+epsilon_start: 0.001
+epsilon_end: 0.001
+epsilon_decay: 1.0
+
+state_discretization:
+  dx_dy_bin_size: 25
+  velocity_bin_size: 2
+
+rewards:
+  pipe_passed: 10
+  alive: 0.05
+  death: -50
+
+environment:
+  player_flap_acc: -10

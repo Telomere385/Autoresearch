@@ -1,7 +1,9 @@
 import numpy as np
+from pathlib import Path
 
+DATA_DIR = Path(__file__).resolve().parents[1] / "data"
 
-Q = np.load('Q_last_lr_0.6.npy')
+Q = np.load(DATA_DIR / 'q_tables' / 'Q_last_lr_0.6.npy')
 
 print("Q dtype:", Q.dtype)
 print("Q shape:", Q.shape)

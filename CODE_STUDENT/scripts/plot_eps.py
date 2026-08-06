@@ -1,10 +1,12 @@
 import numpy as np
 import matplotlib.pyplot as plt
+from pathlib import Path
 
+DATA_DIR = Path(__file__).resolve().parents[1] / "data"
 
-r1 = np.load("ave_reward_eps_0.01.npy")
-r2 = np.load("ave_reward_eps_0.001.npy")
-r3 = np.load("ave_reward_eps_0.0001.npy")
+r1 = np.load(DATA_DIR / "rewards" / "ave_reward_eps_0.01.npy")
+r2 = np.load(DATA_DIR / "rewards" / "ave_reward_eps_0.001.npy")
+r3 = np.load(DATA_DIR / "rewards" / "ave_reward_eps_0.0001.npy")
 
 episodes1 = np.arange(1, len(r1) + 1) * 100  # 每个点对应100局
 episodes2 = np.arange(1, len(r2) + 1) * 100

@@ -1,6 +1,9 @@
 from itertools import cycle
+import json
+from pathlib import Path
 import random
 import sys
+import time
 import numpy as np
 from sys import argv
 
@@ -15,6 +18,32 @@ PIPEGAPSIZE  = 100 # gap between upper and lower part of pipe
 BASEY        = SCREENHEIGHT * 0.79
 # image, sound and hitmask  dicts
 IMAGES, SOUNDS, HITMASKS = {}, {}, {}
+BASE_DIR = Path(__file__).resolve().parents[1]
+DATA_DIR = BASE_DIR / 'data'
+
+
+def asset_path(relative_path):
+    return str(BASE_DIR / relative_path)
+
+
+def data_path(*parts):
+    return str(DATA_DIR.joinpath(*parts))
+
+
+def input_path(path):
+    path = Path(path)
+    if path.is_absolute() or path.exists():
+        return str(path)
+    q_table_path = DATA_DIR / 'q_tables' / path
+    if q_table_path.exists():
+        return str(q_table_path)
+    return str(BASE_DIR / path)
+
+
+def output_path(*parts):
+    if RUN_DIR is not None:
+        return str(RUN_DIR.joinpath(*parts))
+    return data_path(*parts)
 
 PIPEGAPSIZE  = 100 # gap between upper and lower pipe
 PIPEWIDTH = 52
@@ -40,16 +69,189 @@ totscore = 0
 screen = True 
 episode_rewards = []  # 用来存每一局的总reward #Plot
 ave_rewards = [] #Plot
+Q = None
+MAX_EPISODES = 1000
+SAVE_EVERY = 100
+RUN_DIR = None
+LEARNING_ENABLED = True
+SAMPLE_T = 3
+GAMMA = 0.95
+EPSILON = 0.001
+EPSILON_START = 0.001
+EPSILON_END = 0.001
+EPSILON_DECAY = 1.0
+LEARNING_RATE_INITIAL = 0.6
+LEARNING_RATE_MIN = 0.1
+LEARNING_RATE_DECAY = 0.9995
+DISCRETIZATION_R = 25
+DISCRETIZATION_RV = 2
+PIPE_PASSED_REWARD = 10
+DID_NOT_DIE_REWARD = 0.05
+DIE_REWARD = -50
+PLAYER_FLAP_ACC = -10
+EPISODE_SCORES = []
+PROGRESS_METRICS = []
+ACTIVE_CONFIG = None
 
+
+class SilentSound:
+    def play(self):
+        pass
+
+
+def reset_run_state():
+    global reward, olddx, olddy, oldvy, oldflap
+    global counter, rewsum, highscore, totscore
+    global episode_rewards, ave_rewards, EPISODE_SCORES, PROGRESS_METRICS
+
+    reward = 0
+    olddx = 0
+    olddy = 0
+    oldvy = 0
+    oldflap = 0
+    counter = 0
+    rewsum = 0
+    highscore = 0
+    totscore = 0
+    episode_rewards = []
+    ave_rewards = []
+    EPISODE_SCORES = []
+    PROGRESS_METRICS = []
+
+
+# 3.3.2 huristic initialisation of Q values
+def prefill_Q_heuristic(Q, r=25, rv=2):
+    """
+    Heuristic warm-start for Q(dx, dy, vy, a).
+    - dx: distance to next pipe center (pixels), binned by r
+    - dy: vertical distance to pipe gap center (pixels), binned by r, with +512 shift in your code
+    - vy: vertical velocity, binned by rv, with +50 shift in your code
+    a=0: no flap, a=1: flap
+    """
+
+    dx_bins, dy_bins, vy_bins, nA = Q.shape
+    assert nA == 2
+
+    # Reconstruct approximate (dx, dy, vy) values at bin centers
+    dx_vals = (np.arange(dx_bins) + 0.5) * r                 # [0, ...]
+    dy_vals = (np.arange(dy_bins) + 0.5) * r - 512           # reverse your (dy+512)//r
+    vy_vals = (np.arange(vy_bins) + 0.5) * rv - 50           # reverse your (vy+50)//rv
+
+    # Build 3D grids
+    DX = dx_vals[:, None, None]   # shape (dx_bins,1,1)
+    DY = dy_vals[None, :, None]   # shape (1,dy_bins,1)
+    VY = vy_vals[None, None, :]   # shape (1,1,vy_bins)
+
+    # --- Heuristic "urgency" to flap ---
+    # Bigger means flap is more desirable.
+    # Intuition:
+    #   DY > 0 => bird is BELOW the gap center (needs to go up) -> flap more
+    #   VY > 0 => moving downward -> flap more
+    #   DX small => pipe is close -> decisions matter more
+
+    close = np.exp(-DX / 60.0)
+
+    # 只在明显需要上升时才增加flap偏好：DY 大于某个阈值才开始起作用
+    dy_thresh = 50.0
+    need_up = np.maximum(DY - dy_thresh, 0.0)  # ReLU: DY<=50时为0
+
+    # 下坠时更需要 flap，但上升时就别鼓励 flap
+    need_flap_from_vy = np.maximum(VY, 0.0)
+
+    urgency = close * (0.004 * need_up + 0.03 * need_flap_from_vy)
+
+    # 给 flap 一个小惩罚（让 noflap 更容易赢一些）
+    flap_penalty = 0.02 * close
+    # flap_penalty = 0.05 * close
+
+    base = -0.1 * close
+    scale = 0.2
+
+    Q[..., 0] = scale * (base - urgency)          # no flap
+    Q[..., 1] = scale * (base + urgency - flap_penalty)  # flap
+    # Convert to initial Q preferences
+    # Make both actions slightly negative far away (so values not all zero),
+    # then bias flap vs no-flap by urgency.
+
+    # Optional: clamp to avoid crazy magnitudes
+    np.clip(Q, -5.0, 5.0, out=Q)
+
+    return Q
+
+def prefill_Q_simple(Q, r=25, rv=2):
+    dx_bins, dy_bins, vy_bins, nA = Q.shape
+    assert nA == 2
+
+    # 近似恢复物理量
+    dx_vals = (np.arange(dx_bins) + 0.5) * r
+    dy_vals = (np.arange(dy_bins) + 0.5) * r - 512
+    vy_vals = (np.arange(vy_bins) + 0.5) * rv - 50
+
+    DX = dx_vals[:, None, None]
+    DY = dy_vals[None, :, None]
+    VY = vy_vals[None, None, :]
+
+    # 距离权重：越近越重要
+    close = 1.0 / (1.0 + DX / 80.0)
+
+    # 核心逻辑：
+    # DY>0 (在缺口下方) + VY>0 (向下掉) => 倾向 flap
+    preference = close * (0.01 * DY + 0.05 * VY)
+
+    Q[..., 0] = -preference   # no flap
+    Q[..., 1] =  preference   # flap
+
+    np.clip(Q, -5.0, 5.0, out=Q)
+    return Q
+
+def prefill_Q_gap_center_bins(Q, r=25, rv=2,
+                              k_dybin=0.20, k_vybin=0.10, k_near=0.15,
+                              near_dx_bins=3, clip=1.0):
+    dx_bins, dy_bins, vy_bins, nA = Q.shape
+    assert nA == 2
+
+    dy0 = 512 // r
+    vy0 = 50 // rv
+
+    Dx = np.arange(dx_bins)[:, None, None]
+    Dy = np.arange(dy_bins)[None, :, None]
+    Vy = np.arange(vy_bins)[None, None, :]
+
+    # 关键：+ 0*Dx 让 A 直接拥有 dx 维度 -> (dx,dy,vy)
+    A = k_dybin * (Dy - dy0) + k_vybin * (Vy - vy0) + 0.0 * Dx
+    A -= k_near * (Dx < near_dx_bins).astype(float)
+    A = np.clip(A, -clip, clip)
+
+    Q[..., 0] = -0.5 * A
+    Q[..., 1] = +0.5 * A
+    return Q
 
 
 if(len(argv)) == 2:
     if argv[1] == 'play':
-        Q = np.load('Q_last_lr_0.6.npy')
+        Q = np.load(data_path('q_tables', 'Q_last_lr_0.6.npy'))
         FPS = 30
         screen = True
     elif argv[1] == 'train':
-        Q = np.load('Qvals.npy') 
+        Q = np.load(data_path('q_tables', 'Qvals.npy')) 
+        
+        # Q_old = np.load(data_path('q_tables', 'Q_last_lr_0.6.npy'))  # 3.3.2-1
+        Q = prefill_Q_heuristic(Q, r=25, rv=2) # 3.3.2-2
+        # Q = prefill_Q_simple(Q, r=25, rv=2) # 3.3.2-3
+        # Q = prefill_Q_gap_center_bins(Q, r=25, rv=2)
+        # Q = 0.7 * Q + 0.3 * Q_old # 3.3.2-4
+
+        print("Q shape:", Q.shape)
+        print("Q min/max:", Q.min(), Q.max())
+        print("Q mean/std:", Q.mean(), Q.std())
+        print("Nonzero:", np.count_nonzero(Q))
+        # flap vs noflap 的整体偏好：正数表示更偏 flap
+        pref = Q[...,1] - Q[...,0]
+        print("pref (Q1-Q0) min/max/mean:", pref.min(), pref.max(), pref.mean())
+        # 看看有多少状态更偏 flap
+        print("frac prefer flap:", np.mean(pref > 0))
+
+
         FPS = 1500
         screen = False
         print('Starting to train!')
@@ -62,7 +264,7 @@ elif(len(argv)) == 3:
         FPS = 30
         screen = True
         try:
-            Q = np.load(argv[2])
+            Q = np.load(input_path(argv[2]))
         except:
             print('Failed loading file!')
             exit()
@@ -70,7 +272,7 @@ elif(len(argv)) == 3:
         FPS = 1500
         screen = False
         try:
-            Q = np.load(argv[2])
+            Q = np.load(input_path(argv[2]))
         except:
             print('Failed loading file!')
             exit()
@@ -80,40 +282,151 @@ elif(len(argv)) == 3:
         print('If you want to load a specific Q matrix, the second one should be a filename.')
         exit()
 
+# list of all possible players (tuple of 3 positions of flap)
+def configure_experiment(config, mode, run_dir=None):
+    global Q, FPS, screen, MAX_EPISODES, SAVE_EVERY, RUN_DIR, LEARNING_ENABLED
+    global SAMPLE_T, GAMMA, EPSILON, EPSILON_START, EPSILON_END, EPSILON_DECAY, LEARNING_RATE_INITIAL, LEARNING_RATE_MIN
+    global LEARNING_RATE_DECAY, DISCRETIZATION_R, DISCRETIZATION_RV
+    global PIPE_PASSED_REWARD, DID_NOT_DIE_REWARD, DIE_REWARD, PLAYER_FLAP_ACC, ACTIVE_CONFIG
+
+    reset_run_state()
+    ACTIVE_CONFIG = dict(config)
+    RUN_DIR = Path(run_dir) if run_dir is not None else None
+    episodes_key = 'training_episodes' if mode == 'train' else 'evaluation_episodes'
+    MAX_EPISODES = int(config.get(episodes_key, config.get('max_episodes', MAX_EPISODES)))
+    SAVE_EVERY = int(config.get('save_every', SAVE_EVERY))
+    SAMPLE_T = int(config.get('sample_t', SAMPLE_T))
+    GAMMA = float(config.get('gamma', GAMMA))
+    EPSILON_START = float(config.get('epsilon_start', config.get('epsilon', EPSILON_START)))
+    EPSILON_END = float(config.get('epsilon_end', EPSILON_END))
+    EPSILON_DECAY = float(config.get('epsilon_decay', EPSILON_DECAY))
+    EPSILON = EPSILON_START
+    LEARNING_RATE_INITIAL = float(config.get('learning_rate', config.get('learning_rate_initial', LEARNING_RATE_INITIAL)))
+    LEARNING_RATE_MIN = float(config.get('learning_rate_min', LEARNING_RATE_MIN))
+    LEARNING_RATE_DECAY = float(config.get('learning_rate_decay', LEARNING_RATE_DECAY))
+    DISCRETIZATION_R = int(config.get('r', DISCRETIZATION_R))
+    DISCRETIZATION_RV = int(config.get('rv', DISCRETIZATION_RV))
+    PIPE_PASSED_REWARD = float(config.get('pipe_passed_reward', PIPE_PASSED_REWARD))
+    DID_NOT_DIE_REWARD = float(config.get('did_not_die_reward', DID_NOT_DIE_REWARD))
+    DIE_REWARD = float(config.get('die_reward', DIE_REWARD))
+    PLAYER_FLAP_ACC = float(config.get('player_flap_acc', PLAYER_FLAP_ACC))
+    FPS = int(config.get('fps_train' if mode == 'train' else 'fps_eval', FPS))
+    screen = bool(config.get('render', False))
+    LEARNING_ENABLED = mode == 'train'
+
+    Q = np.load(input_path(config.get('input_q_table', 'data/q_tables/Qvals.npy')))
+    init = config.get('q_init', 'none')
+    if mode == 'train':
+        if init == 'heuristic':
+            Q = prefill_Q_heuristic(Q, r=DISCRETIZATION_R, rv=DISCRETIZATION_RV)
+        elif init == 'simple':
+            Q = prefill_Q_simple(Q, r=DISCRETIZATION_R, rv=DISCRETIZATION_RV)
+        elif init == 'gap_center_bins':
+            Q = prefill_Q_gap_center_bins(Q, r=DISCRETIZATION_R, rv=DISCRETIZATION_RV)
+
+
+def write_json(path, payload):
+    with open(path, 'w', encoding='utf-8') as f:
+        json.dump(payload, f, indent=2)
+
+
+def summarize_metrics(mode, started_at, ended_at):
+    rewards = np.array(episode_rewards, dtype=float)
+    scores = np.array(EPISODE_SCORES, dtype=float)
+    last_100 = rewards[-100:] if len(rewards) else rewards
+    return {
+        'status': 'ok',
+        'mode': mode,
+        'episodes': int(len(rewards)),
+        'training_episodes': int(len(rewards)) if mode == 'train' else 0,
+        'evaluation_episodes': int(len(rewards)) if mode == 'eval' else 0,
+        'seed': ACTIVE_CONFIG.get('seed') if ACTIVE_CONFIG is not None else None,
+        'training_time': float(ended_at - started_at) if mode == 'train' else 0.0,
+        'duration_seconds': float(ended_at - started_at),
+        'mean_reward': float(rewards.mean()) if len(rewards) else 0.0,
+        'last_100_mean_reward': float(last_100.mean()) if len(last_100) else 0.0,
+        'best_reward': float(rewards.max()) if len(rewards) else 0.0,
+        'mean_score': float(scores.mean()) if len(scores) else 0.0,
+        'std_score': float(scores.std()) if len(scores) else 0.0,
+        'best_score': int(scores.max()) if len(scores) else 0,
+        'max_score': int(scores.max()) if len(scores) else 0,
+        'nonzero_q_values': int(np.count_nonzero(Q)),
+        'q_min': float(Q.min()),
+        'q_max': float(Q.max()),
+        'q_mean': float(Q.mean()),
+        'hyperparameters': {
+            'learning_rate': LEARNING_RATE_INITIAL,
+            'learning_rate_min': LEARNING_RATE_MIN,
+            'learning_rate_decay': LEARNING_RATE_DECAY,
+            'discount_factor': GAMMA,
+            'epsilon_start': EPSILON_START,
+            'epsilon_end': EPSILON_END,
+            'epsilon_decay': EPSILON_DECAY,
+            'sample_t': SAMPLE_T,
+            'r': DISCRETIZATION_R,
+            'rv': DISCRETIZATION_RV,
+        },
+        'progress': PROGRESS_METRICS,
+    }
+
+
+def save_run_outputs(mode, started_at, ended_at):
+    metrics = summarize_metrics(mode, started_at, ended_at)
+    if RUN_DIR is not None:
+        RUN_DIR.mkdir(parents=True, exist_ok=True)
+        np.save(RUN_DIR / 'q_table.npy', Q)
+        np.save(RUN_DIR / 'rewards.npy', np.array(episode_rewards, dtype=float))
+        np.save(RUN_DIR / 'average_rewards.npy', np.array(ave_rewards, dtype=float))
+        write_json(RUN_DIR / 'metrics.json', metrics)
+    return metrics
+
+
+def run_configured_experiment(config, mode, run_dir=None):
+    if 'seed' in config and config['seed'] is not None:
+        random.seed(int(config['seed']))
+        np.random.seed(int(config['seed']))
+    configure_experiment(config, mode, run_dir)
+    started_at = time.time()
+    try:
+        main()
+    finally:
+        pygame.quit()
+    ended_at = time.time()
+    return save_run_outputs(mode, started_at, ended_at)
 
 
 # list of all possible players (tuple of 3 positions of flap)
 PLAYERS_LIST = (
     # red bird
     (
-        'assets/sprites/redbird-upflap.png',
-        'assets/sprites/redbird-midflap.png',
-        'assets/sprites/redbird-downflap.png',
+        asset_path('assets/sprites/redbird-upflap.png'),
+        asset_path('assets/sprites/redbird-midflap.png'),
+        asset_path('assets/sprites/redbird-downflap.png'),
     ),
     # blue bird
     (
-        'assets/sprites/bluebird-upflap.png',
-        'assets/sprites/bluebird-midflap.png',
-        'assets/sprites/bluebird-downflap.png',
+        asset_path('assets/sprites/bluebird-upflap.png'),
+        asset_path('assets/sprites/bluebird-midflap.png'),
+        asset_path('assets/sprites/bluebird-downflap.png'),
     ),
     # yellow bird
     (
-        'assets/sprites/yellowbird-upflap.png',
-        'assets/sprites/yellowbird-midflap.png',
-        'assets/sprites/yellowbird-downflap.png',
+        asset_path('assets/sprites/yellowbird-upflap.png'),
+        asset_path('assets/sprites/yellowbird-midflap.png'),
+        asset_path('assets/sprites/yellowbird-downflap.png'),
     ),
 )
 
 # list of backgrounds
 BACKGROUNDS_LIST = (
-    'assets/sprites/background-day.png',
-    'assets/sprites/background-night.png',
+    asset_path('assets/sprites/background-day.png'),
+    asset_path('assets/sprites/background-night.png'),
 )
 
 # list of pipes
 PIPES_LIST = (
-    'assets/sprites/pipe-green.png',
-    'assets/sprites/pipe-red.png',
+    asset_path('assets/sprites/pipe-green.png'),
+    asset_path('assets/sprites/pipe-red.png'),
 )
 
 
@@ -136,24 +449,24 @@ def main():
 
     # numbers sprites for score display
     IMAGES['numbers'] = (
-        pygame.image.load('assets/sprites/0.png').convert_alpha(),
-        pygame.image.load('assets/sprites/1.png').convert_alpha(),
-        pygame.image.load('assets/sprites/2.png').convert_alpha(),
-        pygame.image.load('assets/sprites/3.png').convert_alpha(),
-        pygame.image.load('assets/sprites/4.png').convert_alpha(),
-        pygame.image.load('assets/sprites/5.png').convert_alpha(),
-        pygame.image.load('assets/sprites/6.png').convert_alpha(),
-        pygame.image.load('assets/sprites/7.png').convert_alpha(),
-        pygame.image.load('assets/sprites/8.png').convert_alpha(),
-        pygame.image.load('assets/sprites/9.png').convert_alpha()
+        pygame.image.load(asset_path('assets/sprites/0.png')).convert_alpha(),
+        pygame.image.load(asset_path('assets/sprites/1.png')).convert_alpha(),
+        pygame.image.load(asset_path('assets/sprites/2.png')).convert_alpha(),
+        pygame.image.load(asset_path('assets/sprites/3.png')).convert_alpha(),
+        pygame.image.load(asset_path('assets/sprites/4.png')).convert_alpha(),
+        pygame.image.load(asset_path('assets/sprites/5.png')).convert_alpha(),
+        pygame.image.load(asset_path('assets/sprites/6.png')).convert_alpha(),
+        pygame.image.load(asset_path('assets/sprites/7.png')).convert_alpha(),
+        pygame.image.load(asset_path('assets/sprites/8.png')).convert_alpha(),
+        pygame.image.load(asset_path('assets/sprites/9.png')).convert_alpha()
     )
 
     # game over sprite
-    IMAGES['gameover'] = pygame.image.load('assets/sprites/gameover.png').convert_alpha()
+    IMAGES['gameover'] = pygame.image.load(asset_path('assets/sprites/gameover.png')).convert_alpha()
     # message sprite for welcome screen
-    IMAGES['message'] = pygame.image.load('assets/sprites/message.png').convert_alpha()
+    IMAGES['message'] = pygame.image.load(asset_path('assets/sprites/message.png')).convert_alpha()
     # base (ground) sprite
-    IMAGES['base'] = pygame.image.load('assets/sprites/base.png').convert_alpha()
+    IMAGES['base'] = pygame.image.load(asset_path('assets/sprites/base.png')).convert_alpha()
 
     # sounds
     if 'win' in sys.platform:
@@ -161,13 +474,15 @@ def main():
     else:
         soundExt = '.ogg'
 
-    SOUNDS['die']    = pygame.mixer.Sound('assets/audio/die' + soundExt)
-    SOUNDS['hit']    = pygame.mixer.Sound('assets/audio/hit' + soundExt)
-    SOUNDS['point']  = pygame.mixer.Sound('assets/audio/point' + soundExt)
-    SOUNDS['swoosh'] = pygame.mixer.Sound('assets/audio/swoosh' + soundExt)
-    SOUNDS['wing']   = pygame.mixer.Sound('assets/audio/wing' + soundExt)
+    try:
+        SOUNDS['die']    = pygame.mixer.Sound(asset_path('assets/audio/die' + soundExt))
+        SOUNDS['hit']    = pygame.mixer.Sound(asset_path('assets/audio/hit' + soundExt))
+        SOUNDS['point']  = pygame.mixer.Sound(asset_path('assets/audio/point' + soundExt))
+        SOUNDS['swoosh'] = pygame.mixer.Sound(asset_path('assets/audio/swoosh' + soundExt))
+        SOUNDS['wing']   = pygame.mixer.Sound(asset_path('assets/audio/wing' + soundExt))
+    except pygame.error:
+        SOUNDS['die'] = SOUNDS['hit'] = SOUNDS['point'] = SOUNDS['swoosh'] = SOUNDS['wing'] = SilentSound()
 
-    MAX_EPISODES = 5000 #3.3.2
     while counter < MAX_EPISODES:
     # while True:
         # select random background sprites
@@ -302,7 +617,7 @@ def mainGame(movementInfo):
     playerVelRot  =   3   # angular speed
     playerRotThr  =  20   # rotation threshold
     #playerFlapAcc =  -14   # players speed on flapping
-    playerFlapAcc =  -10  # players speed on flapping
+    playerFlapAcc = PLAYER_FLAP_ACC  # players speed on flapping
     playerFlapped = False # True when player flaps
 
 
@@ -356,39 +671,44 @@ def mainGame(movementInfo):
         dx = int(dx)
 
         # rewards
-        pipePassedReward = 10
-        didNotDieReward = 0.05
-        dieReward = -50
+        pipePassedReward = PIPE_PASSED_REWARD
+        didNotDieReward = DID_NOT_DIE_REWARD
+        dieReward = DIE_REWARD
 
 
         # loopIter is a frame counter going from 0 to 30, and then resetting
         # every now and then, we want to take an action
         # this might be every frame, might be every 15 frames...
-        sampleT = 3
+        sampleT = SAMPLE_T
 
         if loopIter % sampleT == 0:
 
             # ni is the learning rate
             # ni = 0.4
-            ni = max(0.1, 0.6 * (0.999 ** counter))
+            ni = max(LEARNING_RATE_MIN, LEARNING_RATE_INITIAL * (LEARNING_RATE_DECAY ** counter))
             # ni = max(0.1, 0.7 * (0.999 ** counter))
             # ni = max(0.1, 0.4 * (0.999 ** counter))
             # ni = max(0.1, 0.9 * (0.999 ** counter))
             # r is the discretisation rate for (dx, dy)
-            r = 25
+            r = DISCRETIZATION_R
             # rv is the discretisation rate for vy
-            rv = 2
+            rv = DISCRETIZATION_RV
 
             # s_t represents the last state we were in
             # s_tp is the state we're in now (the one we want to max over)
-            s_t =  (olddx//r, (olddy + 512)//r, (oldvy + 50)//rv, int(oldflap))
-            s_tp = (dx//r   , (dy + 512)//r   , (vy + 50)//rv)
+            s_t =  (int(olddx//r), int((olddy + 512)//r), int((oldvy + 50)//rv), int(oldflap))
+            s_tp = (int(dx//r)   , int((dy + 512)//r)   , int((vy + 50)//rv))
 
             # Q update equation
-            Q[s_t] = (1 - ni)*Q[s_t] + ni*(reward + 0.95*np.max(Q[s_tp]))
+            if LEARNING_ENABLED:
+                Q[s_t] = (1 - ni)*Q[s_t] + ni*(reward + GAMMA*np.max(Q[s_tp]))
 
             # epsilon-greedy step
-            eps = 0.001
+            if LEARNING_ENABLED:
+                eps = EPSILON_END + (EPSILON_START - EPSILON_END) * (EPSILON_DECAY ** counter)
+                eps = min(max(eps, min(EPSILON_START, EPSILON_END)), max(EPSILON_START, EPSILON_END))
+            else:
+                eps = 0.0
             if np.random.random() <= eps:
                 flap = np.random.choice([True, False])
             else:
@@ -431,27 +751,48 @@ def mainGame(movementInfo):
             episode_reward += dieReward #Plot
 
             episode_rewards.append(episode_reward) #Plot
+            EPISODE_SCORES.append(score)
 
             counter += 1
-            if counter % 100 == 0:
+            if SAVE_EVERY > 0 and counter % SAVE_EVERY == 0:
                 print("_________________________________________________")
                 print("Round", counter)
-                print("Average reward in last 100 runs:", rewsum/100)
+                print("Average reward in last", SAVE_EVERY, "runs:", rewsum/SAVE_EVERY)
                 print("Nonzero Q values", np.count_nonzero(Q))
-                print("Avg score, high score:", totscore/100, highscore)
+                print("Avg score, high score:", totscore/SAVE_EVERY, highscore)
 
-                avg100 = rewsum / 100
+                avg100 = rewsum / SAVE_EVERY
                 ave_rewards.append(avg100)
-                np.save('ave_reward.npy', np.array(ave_rewards, dtype=float))
+                PROGRESS_METRICS.append({
+                    'episode': counter,
+                    'average_reward': float(avg100),
+                    'average_score': float(totscore / SAVE_EVERY),
+                    'high_score': int(highscore),
+                    'nonzero_q_values': int(np.count_nonzero(Q)),
+                })
+                if RUN_DIR is not None:
+                    RUN_DIR.mkdir(parents=True, exist_ok=True)
+                    np.save(output_path('average_rewards.npy'), np.array(ave_rewards, dtype=float))
+                else:
+                    (DATA_DIR / 'prefill').mkdir(parents=True, exist_ok=True)
+                    (DATA_DIR / 'q_tables').mkdir(parents=True, exist_ok=True)
+                    (DATA_DIR / 'rewards').mkdir(parents=True, exist_ok=True)
+                    np.save(data_path('prefill', 'prefill_heuristic.npy'), np.array(ave_rewards, dtype=float))
 
                 rewsum = 0
                 highscore = 0
                 totscore = 0
+                if RUN_DIR is not None:
+                    np.save(output_path('q_table.npy'), Q)
+                    np.save(output_path('rewards.npy'), np.array(episode_rewards, dtype=float)) #Plot #save_rewards
+                else:
+                    np.save(data_path('q_tables', 'Q_last_pre_heuristic.npy'), Q)
+                    np.save(data_path('rewards', 'rewards_pre_heuristic.npy'), np.array(episode_rewards, dtype=float)) #Plot #save_rewards
                 
-                np.save('Q_last.npy', Q)
-                np.save('rewards.npy', np.array(episode_rewards, dtype=float)) #Plot #save_rewards
-                
-                print('Saved progress in Q_last.npy and rewards.npy')
+                if RUN_DIR is not None:
+                    print('Saved progress in', RUN_DIR)
+                else:
+                    print('Saved progress in data/q_tables and data/rewards')
 
             return {
                 'y': playery,
