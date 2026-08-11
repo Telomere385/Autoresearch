@@ -1,15 +1,19 @@
+program_file: PROGRAM.md
+task_file: configs/task.yaml
 goal_file: goals/default_goal.md
 
 planner:
-  type: rules
-  provider: disabled
-  model: null
-  api_key_env: null
+  type: llm
+  provider: openai
+  model: gpt-4o-mini
+  api_key_env: OPENAI_API_KEY
   timeout_seconds: 60
+  temperature: 0.2
   local_endpoint: null
+  local_command: null
 
 budget:
-  max_iterations: 5
+  max_iterations: 3
   max_wall_time_minutes: 30
   seed: 0
   training_episodes: 1000

@@ -107,6 +107,10 @@ def apply_changes(base_config, changes):
     return candidate
 
 
+def config_fingerprint(config):
+    return json.dumps(config, sort_keys=True, separators=(",", ":"))
+
+
 def validate_candidate(candidate, search_space, constraints, base_config):
     errors = []
     changes = candidate.get("changes", {})
@@ -236,8 +240,18 @@ def reflect_on_result(summary, best, objective):
     return reflection
 
 
-def make_context(config, goal, iteration, current_config, best, last, history):
+def optional_text(path):
+    return read_text(path) if path.exists() else ""
+
+
+def optional_yaml(path):
+    return load_yaml(path) if path.exists() else {}
+
+
+def make_context(config, program, task, goal, iteration, current_config, best, last, history):
     return {
+        "program": program,
+        "task": task,
         "goal": goal,
         "iteration": iteration,
         "objective": config["objective"],
@@ -312,8 +326,8 @@ def generate_report(run_dir, goal, config, baseline, history, best):
         "",
         "## Limitations",
         "- Short smoke runs can keep score at zero; reward is recorded as a diagnostic signal.",
-        "- The default planner is rule-based and intentionally conservative.",
-        "- LLM planners are constrained to proposing YAML parameter changes only.",
+        "- The LLM planner is constrained to proposing YAML parameter changes only.",
+        "- Repeated candidate configurations are rejected before running.",
         "- The Pygame environment is headless but still simulates real game frames.",
     ]
     with open(run_dir / "report.md", "w", encoding="utf-8") as f:
@@ -336,8 +350,13 @@ def main():
     max_iterations = int(config["budget"]["max_iterations"])
     progress = ProgressBar(total_steps=2 + max_iterations * 4)
     progress.update(0, "initializing")
+    program = optional_text(BASE_DIR / config.get("program_file", "PROGRAM.md"))
+    task = optional_yaml(BASE_DIR / config.get("task_file", "configs/task.yaml"))
     goal = read_text(BASE_DIR / config.get("goal_file", "goals/default_goal.md"))
     write_yaml(run_dir / "config.yaml", config)
+    write_yaml(run_dir / "task.yaml", task)
+    with open(run_dir / "program.md", "w", encoding="utf-8") as f:
+        f.write(program)
     with open(run_dir / "goal.md", "w", encoding="utf-8") as f:
         f.write(goal)
 
@@ -366,6 +385,7 @@ def main():
         best = baseline if baseline_summary.get("status") == "success" else None
         last = baseline
         history = []
+        seen_configs = {config_fingerprint(base_config)}
         progress.advance(f"baseline complete mean_score={baseline_summary.get('mean_score')}")
 
         planner = build_planner(config)
@@ -374,7 +394,7 @@ def main():
             iter_dir = run_dir / f"iteration_{iteration:03d}"
             iter_dir.mkdir()
             progress.advance(f"iteration {iteration}/{max_iterations}: planning")
-            context = make_context(config, goal, iteration, current_config, best, last, history)
+            context = make_context(config, program, task, goal, iteration, current_config, best, last, history)
             candidate = planner.propose(context)
             append_jsonl(run_dir / "planner_calls.jsonl", {"iteration": iteration, "candidate": candidate})
             write_json(iter_dir / "planner_output.json", candidate)
@@ -397,6 +417,21 @@ def main():
                 continue
 
             candidate_config = apply_changes(current_config, candidate["changes"])
+            fingerprint = config_fingerprint(candidate_config)
+            if fingerprint in seen_configs:
+                decision = {
+                    "iteration": iteration,
+                    "candidate": candidate,
+                    "validation": validation,
+                    "decision": "reject",
+                    "reason": "candidate repeats a previously tested configuration",
+                }
+                append_jsonl(run_dir / "decisions.jsonl", decision)
+                append_jsonl(run_dir / "errors.jsonl", decision)
+                progress.advance(f"iteration {iteration}/{max_iterations}: duplicate candidate rejected")
+                progress.advance(f"iteration {iteration}/{max_iterations}: skipped")
+                continue
+            seen_configs.add(fingerprint)
             candidate_path = iter_dir / "candidate.yaml"
             write_yaml(candidate_path, candidate_config)
             progress.advance(f"iteration {iteration}/{max_iterations}: running train/eval")

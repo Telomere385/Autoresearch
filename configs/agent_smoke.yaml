@@ -1,12 +1,16 @@
+program_file: PROGRAM.md
+task_file: configs/task.yaml
 goal_file: goals/default_goal.md
 
 planner:
-  type: rules
-  provider: disabled
-  model: null
+  type: llm
+  provider: local_command
+  model: mock-local-planner
   api_key_env: null
   timeout_seconds: 60
+  temperature: 0.0
   local_endpoint: null
+  local_command: python tools/mock_llm_planner.py
 
 budget:
   max_iterations: 1

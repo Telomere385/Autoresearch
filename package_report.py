@@ -135,8 +135,8 @@ The Agent writes:
 
 ## Known Limitations
 
-- This is a compact rules-first Agent, not a general autonomous scientist.
-- The default LLM provider is disabled; LLM planners are optional and constrained.
+- This is a compact LLM-planned Agent, not a general autonomous scientist.
+- LLM output is constrained to YAML parameter changes and validated before execution.
 - Score can remain zero for small training budgets; reward is included as a diagnostic metric.
 - Pygame is headless but still simulates game frames, so runtime grows with train/eval episodes.
 """
@@ -157,7 +157,7 @@ def make_technical_report(run_id, state, decisions, tool_calls):
         "",
         "## 2. Architecture",
         "- `agent.py` is the Agent controller and state machine.",
-        "- `planner/` contains the rules planner and optional LLM planner adapter.",
+        "- `planner/` contains the structured LLM planner and provider adapters.",
         "- `baseline.py` executes one train/eval experiment pair for a single seed.",
         "- `experiment.py` executes one configured train or eval run.",
         "- `src/flappyq.py` contains the original Q-learning environment and update loop.",
@@ -166,8 +166,8 @@ def make_technical_report(run_id, state, decisions, tool_calls):
         "The Agent first runs a baseline, then performs three candidate iterations. Each iteration reads current state, asks the planner for a candidate, validates the proposal against the search space and constraints, writes a YAML config, runs a real train/eval experiment pair, checks JSON results, and decides accept, reject, rollback, or stop.",
         "",
         "## 4. Key Design Choices",
-        "- Offline by default: `planner.provider: disabled` uses deterministic rules.",
-        "- LLM-pluggable: optional LLM output is restricted to structured parameter changes.",
+        "- LLM-planned: provider output is restricted to structured parameter changes.",
+        "- Local testing: `provider: local_command` can exercise the LLM interface without a remote API.",
         "- Safety first: source edits and state-space expansion are blocked.",
         "- Reproducibility: fixed seed, YAML configs, JSONL traces, and per-run artifacts.",
         "- Evaluation isolation: eval uses trained Q-tables and epsilon is forced to zero.",
@@ -216,7 +216,7 @@ def make_technical_report(run_id, state, decisions, tool_calls):
         "",
         "## 8. Limitations And Next Improvements",
         "- Short budgets may keep game score at zero; longer budgets are needed for performance claims.",
-        "- The rules planner is simple and explores only a small predefined search space.",
+        "- The LLM planner is constrained to a small predefined search space.",
         "- OpenAI/Anthropic provider adapters are intentionally guarded and should be completed only with explicit API configuration.",
         "- Future work should add richer statistical tests, wall-time enforcement, and automatic medium/full budget scheduling.",
         "",
@@ -282,10 +282,13 @@ def main():
     decisions = load_decisions(run_dir)
     tool_calls = summarize_tool_calls(run_dir)
 
-    for name in ("state.json", "decisions.jsonl", "planner_calls.jsonl", "tool_calls.jsonl", "errors.jsonl", "report.md", "config.yaml", "goal.md"):
+    for name in ("program.md", "task.yaml", "state.json", "decisions.jsonl", "planner_calls.jsonl", "tool_calls.jsonl", "errors.jsonl", "report.md", "config.yaml", "goal.md"):
         src = run_dir / name
         if src.exists():
             shutil.copy2(src, artifacts / name)
+    prompt_src = BASE_DIR / "prompts" / "final_report.md"
+    if prompt_src.exists():
+        shutil.copy2(prompt_src, artifacts / "final_report_prompt.md")
     reflection_dir = artifacts / "iteration_reflections"
     reflection_dir.mkdir(exist_ok=True)
     for src in sorted(run_dir.glob("iteration_*/reflection.json")):
