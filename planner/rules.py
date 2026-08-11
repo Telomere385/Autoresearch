@@ -111,12 +111,7 @@ def _diagnose(history, best):
 
 
 def _mean_reward(summary):
-    rewards = [
-        item.get("eval_result", {}).get("mean_reward", 0.0)
-        for item in summary.get("seed_results", [])
-        if item.get("eval_status") in {"ok", "success"}
-    ]
-    return sum(rewards) / len(rewards) if rewards else 0.0
+    return float(summary.get("mean_reward", 0.0))
 
 
 def _next_allowed(context, key, current_value):

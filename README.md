@@ -5,11 +5,12 @@ This is a compact, offline-first Mini AutoResearch project around the existing F
 ## Structure
 
 ```text
-CODE_STUDENT/
+Lab2_new/
   agent.py             AutoResearch controller and decision loop.
-  baseline.py          Multi-seed train/eval runner.
+  baseline.py          Single-seed train/eval runner.
   experiment.py        Single train or eval run from YAML.
   package_report.py    Packages one run into a report folder.
+  visualize.py         Renders a local HTML performance dashboard.
   configs/
     agent.yaml         Main AutoResearch configuration.
     experiment.yaml    Default single-experiment configuration.
@@ -80,6 +81,18 @@ Package a completed run:
 
 ```powershell
 python package_report.py --run-id <run_id> --config-used configs/agent.yaml
+```
+
+Render a visual performance dashboard:
+
+```powershell
+python visualize.py --run-id <run_id>
+```
+
+The dashboard is written to:
+
+```text
+reports/<run_id>/dashboard.html
 ```
 
 ## Archive

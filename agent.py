@@ -16,6 +16,29 @@ BASE_DIR = Path(__file__).resolve().parent
 RUNS_DIR = BASE_DIR / "runs"
 
 
+class ProgressBar:
+    def __init__(self, total_steps):
+        self.total_steps = max(1, int(total_steps))
+        self.current = 0
+
+    def update(self, step, message):
+        self.current = min(self.total_steps, max(self.current, int(step)))
+        width = 28
+        filled = int(width * self.current / self.total_steps)
+        bar = "#" * filled + "-" * (width - filled)
+        print(f"\r[{bar}] {self.current}/{self.total_steps} {message}", end="", flush=True)
+
+    def advance(self, message):
+        self.update(self.current + 1, message)
+
+    def line(self, message):
+        print(f"\n{message}", flush=True)
+
+    def finish(self, message):
+        self.update(self.total_steps, message)
+        print("", flush=True)
+
+
 def load_yaml(path):
     with open(path, "r", encoding="utf-8") as f:
         data = yaml.safe_load(f)
@@ -60,7 +83,7 @@ def build_run_dir(run_id):
 def baseline_config_from_agent_config(config):
     budget = config["budget"]
     base = copy.deepcopy(config["base_experiment"])
-    base["seeds"] = budget["seeds"]
+    base["seed"] = budget.get("seed", base.get("seed", 0))
     base["training_episodes"] = budget["training_episodes"]
     base["evaluation_episodes"] = budget["evaluation_episodes"]
     base["save_every"] = budget.get("save_every", max(1, min(100, budget["training_episodes"])))
@@ -105,7 +128,7 @@ def validate_candidate(candidate, search_space, constraints, base_config):
     return {"valid": not errors, "errors": errors}
 
 
-def run_baseline(config_path, run_id, tool_log_path):
+def run_baseline(config_path, run_id, tool_log_path, progress=None):
     cmd = [
         sys.executable,
         str(BASE_DIR / "baseline.py"),
@@ -115,24 +138,36 @@ def run_baseline(config_path, run_id, tool_log_path):
         run_id,
     ]
     started = time.time()
-    completed = subprocess.run(
+    process = subprocess.Popen(
         cmd,
         cwd=str(BASE_DIR),
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
+        bufsize=1,
     )
+    stdout_lines = []
+    if process.stdout is not None:
+        for line in process.stdout:
+            stdout_lines.append(line)
+            stripped = line.strip()
+            if progress and stripped:
+                if stripped.startswith("Round "):
+                    progress.line(f"  {stripped}")
+                elif stripped.startswith('"status"') or stripped.startswith('"mean_score"'):
+                    progress.line(f"  {stripped}")
+    returncode = process.wait()
     ended = time.time()
     payload = {
         "command": cmd,
-        "returncode": completed.returncode,
-        "stdout": completed.stdout,
+        "returncode": returncode,
+        "stdout": "".join(stdout_lines),
         "started_at": started,
         "ended_at": ended,
         "duration_seconds": ended - started,
     }
     append_jsonl(tool_log_path, payload)
-    return completed.returncode, RUNS_DIR / run_id / "summary.json"
+    return returncode, RUNS_DIR / run_id / "summary.json"
 
 
 def load_summary(summary_path):
@@ -142,13 +177,6 @@ def load_summary(summary_path):
 
 
 def metric_value(summary, metric):
-    if metric == "mean_reward":
-        rewards = [
-            item.get("eval_result", {}).get("mean_reward", 0.0)
-            for item in summary.get("seed_results", [])
-            if item.get("eval_status") in {"ok", "success"}
-        ]
-        return sum(rewards) / len(rewards) if rewards else 0.0
     return float(summary.get(metric, 0.0))
 
 
@@ -253,7 +281,7 @@ def generate_report(run_dir, goal, config, baseline, history, best):
         "## Configuration",
         f"- Planner: {config.get('planner', {}).get('type', 'rules')} / {config.get('planner', {}).get('provider', 'disabled')}",
         f"- Max iterations: {config['budget']['max_iterations']}",
-        f"- Seeds: {config['budget']['seeds']}",
+        f"- Seed: {config['budget'].get('seed', 0)}",
         f"- Training episodes: {config['budget']['training_episodes']}",
         f"- Evaluation episodes: {config['budget']['evaluation_episodes']}",
         "",
@@ -305,6 +333,9 @@ def main():
     started = time.time()
     run_id, run_dir = build_run_dir(args.run_id)
     config = load_yaml(Path(args.config))
+    max_iterations = int(config["budget"]["max_iterations"])
+    progress = ProgressBar(total_steps=2 + max_iterations * 4)
+    progress.update(0, "initializing")
     goal = read_text(BASE_DIR / config.get("goal_file", "goals/default_goal.md"))
     write_yaml(run_dir / "config.yaml", config)
     with open(run_dir / "goal.md", "w", encoding="utf-8") as f:
@@ -324,27 +355,31 @@ def main():
         base_config = baseline_config_from_agent_config(config)
         if config.get("failure_demo", {}).get("enabled", False):
             run_failure_demo(run_dir, config, base_config)
+            progress.line("Recorded validation failure demo and rollback.")
 
         baseline_config_path = run_dir / "baseline_candidate.yaml"
         write_yaml(baseline_config_path, base_config)
-        _, baseline_summary_path = run_baseline(baseline_config_path, f"{run_id}/baseline", run_dir / "tool_calls.jsonl")
+        progress.advance("running baseline train/eval")
+        _, baseline_summary_path = run_baseline(baseline_config_path, f"{run_id}/baseline", run_dir / "tool_calls.jsonl", progress)
         baseline_summary = load_summary(baseline_summary_path)
         baseline = {"label": "baseline", "config": base_config, "summary": baseline_summary}
         best = baseline if baseline_summary.get("status") == "success" else None
         last = baseline
         history = []
+        progress.advance(f"baseline complete mean_score={baseline_summary.get('mean_score')}")
 
         planner = build_planner(config)
         current_config = base_config
-        max_iterations = int(config["budget"]["max_iterations"])
         for iteration in range(1, max_iterations + 1):
             iter_dir = run_dir / f"iteration_{iteration:03d}"
             iter_dir.mkdir()
+            progress.advance(f"iteration {iteration}/{max_iterations}: planning")
             context = make_context(config, goal, iteration, current_config, best, last, history)
             candidate = planner.propose(context)
             append_jsonl(run_dir / "planner_calls.jsonl", {"iteration": iteration, "candidate": candidate})
             write_json(iter_dir / "planner_output.json", candidate)
 
+            progress.advance(f"iteration {iteration}/{max_iterations}: validating")
             validation = validate_candidate(candidate, config["search_space"], config.get("constraints", {}), current_config)
             write_json(iter_dir / "validation.json", validation)
             if not validation["valid"]:
@@ -357,12 +392,15 @@ def main():
                 }
                 append_jsonl(run_dir / "decisions.jsonl", decision)
                 append_jsonl(run_dir / "errors.jsonl", decision)
+                progress.advance(f"iteration {iteration}/{max_iterations}: invalid candidate rollback")
+                progress.advance(f"iteration {iteration}/{max_iterations}: skipped")
                 continue
 
             candidate_config = apply_changes(current_config, candidate["changes"])
             candidate_path = iter_dir / "candidate.yaml"
             write_yaml(candidate_path, candidate_config)
-            returncode, summary_path = run_baseline(candidate_path, f"{run_id}/iteration_{iteration:03d}/baseline", run_dir / "tool_calls.jsonl")
+            progress.advance(f"iteration {iteration}/{max_iterations}: running train/eval")
+            returncode, summary_path = run_baseline(candidate_path, f"{run_id}/iteration_{iteration:03d}/baseline", run_dir / "tool_calls.jsonl", progress)
             summary = load_summary(summary_path)
             reflection = reflect_on_result(summary, best, config["objective"])
             write_json(iter_dir / "reflection.json", reflection)
@@ -384,6 +422,7 @@ def main():
             if decision == "accept":
                 best = last
                 current_config = candidate_config
+            progress.advance(f"iteration {iteration}/{max_iterations}: {decision} mean_score={summary.get('mean_score')}")
             state.update({
                 "iteration": iteration,
                 "best": {"label": best["label"], "summary": best["summary"]} if best else None,
@@ -396,7 +435,9 @@ def main():
         state["best"] = {"label": best["label"], "summary": best["summary"]} if best else None
         write_state(run_dir, state)
         generate_report(run_dir, goal, config, baseline, history, best)
+        progress.finish("complete")
     except Exception as exc:
+        progress.line("Agent failed; writing error state.")
         state["status"] = "error"
         state["error"] = {"type": type(exc).__name__, "message": str(exc), "traceback": traceback.format_exc()}
         append_jsonl(run_dir / "errors.jsonl", state["error"])

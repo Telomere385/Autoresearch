@@ -9,16 +9,16 @@ planner:
   local_endpoint: null
 
 budget:
-  max_iterations: 5
-  max_wall_time_minutes: 30
+  max_iterations: 1
+  max_wall_time_minutes: 5
   seed: 0
-  training_episodes: 1000
-  evaluation_episodes: 100
-  save_every: 100
+  training_episodes: 1
+  evaluation_episodes: 1
+  save_every: 1
 
 objective:
   primary_metric: mean_score
-  target_mean_score: 5.0
+  target_mean_score: 1.0
   tie_breaker_metric: mean_reward
   tie_breaker_min_improvement: 0.0
   diagnostic_metrics: [mean_reward, total_training_time]
@@ -50,14 +50,14 @@ base_experiment:
     player_flap_acc: -10
 
 search_space:
-  training_episodes: [1000, 1500, 2000]
-  learning_rate: [0.3, 0.4, 0.6, 0.7]
-  epsilon_start: [0.0, 0.001, 0.01, 0.05]
+  training_episodes: [1, 2]
+  learning_rate: [0.4, 0.6]
+  epsilon_start: [0.001, 0.01, 0.05]
   epsilon_end: [0.0, 0.001]
-  epsilon_decay: [0.99, 0.995, 1.0]
-  discount_factor: [0.9, 0.95, 0.99]
-  sample_t: [2, 3, 4]
-  rewards.alive: [0.02, 0.05, 0.1]
+  epsilon_decay: [0.995, 1.0]
+  discount_factor: [0.95, 0.99]
+  sample_t: [2, 3]
+  rewards.alive: [0.05, 0.1]
 
 constraints:
   forbid_source_edits: true

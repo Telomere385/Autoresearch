@@ -3,6 +3,8 @@ import json
 from pathlib import Path
 import shutil
 
+from visualize import collect_experiments, make_html, read_jsonl
+
 
 BASE_DIR = Path(__file__).resolve().parent
 RUNS_DIR = BASE_DIR / "runs"
@@ -28,13 +30,6 @@ def write_text(path, content):
 def metric_value(summary, metric):
     if not summary:
         return 0.0
-    if metric == "mean_reward":
-        rewards = [
-            item.get("eval_result", {}).get("mean_reward", 0.0)
-            for item in summary.get("seed_results", [])
-            if item.get("eval_status") in {"ok", "success"}
-        ]
-        return sum(rewards) / len(rewards) if rewards else 0.0
     return summary.get(metric, 0.0)
 
 
@@ -121,7 +116,7 @@ The main input is `{config_used}`, which contains:
 - natural language goal path
 - planner selection
 - training/evaluation budget
-- seed list
+- random seed
 - objective metric
 - allowed search space
 - safety constraints
@@ -143,7 +138,7 @@ The Agent writes:
 - This is a compact rules-first Agent, not a general autonomous scientist.
 - The default LLM provider is disabled; LLM planners are optional and constrained.
 - Score can remain zero for small training budgets; reward is included as a diagnostic metric.
-- Pygame is headless but still simulates game frames, so runtime grows with episodes and seeds.
+- Pygame is headless but still simulates game frames, so runtime grows with train/eval episodes.
 """
 
 
@@ -163,18 +158,18 @@ def make_technical_report(run_id, state, decisions, tool_calls):
         "## 2. Architecture",
         "- `agent.py` is the Agent controller and state machine.",
         "- `planner/` contains the rules planner and optional LLM planner adapter.",
-        "- `baseline.py` executes multi-seed train/eval experiments.",
+        "- `baseline.py` executes one train/eval experiment pair for a single seed.",
         "- `experiment.py` executes one configured train or eval run.",
         "- `src/flappyq.py` contains the original Q-learning environment and update loop.",
         "",
         "## 3. Core Flow",
-        "The Agent first runs a baseline, then performs three candidate iterations. Each iteration reads current state, asks the planner for a candidate, validates the proposal against the search space and constraints, writes a YAML config, runs real multi-seed experiments, checks JSON results, and decides accept, reject, rollback, or stop.",
+        "The Agent first runs a baseline, then performs three candidate iterations. Each iteration reads current state, asks the planner for a candidate, validates the proposal against the search space and constraints, writes a YAML config, runs a real train/eval experiment pair, checks JSON results, and decides accept, reject, rollback, or stop.",
         "",
         "## 4. Key Design Choices",
         "- Offline by default: `planner.provider: disabled` uses deterministic rules.",
         "- LLM-pluggable: optional LLM output is restricted to structured parameter changes.",
         "- Safety first: source edits and state-space expansion are blocked.",
-        "- Reproducibility: fixed seeds, YAML configs, JSONL traces, and per-run artifacts.",
+        "- Reproducibility: fixed seed, YAML configs, JSONL traces, and per-run artifacts.",
         "- Evaluation isolation: eval uses trained Q-tables and epsilon is forced to zero.",
         "",
         "## 5. Experiment Results",
@@ -299,6 +294,8 @@ def main():
     write_text(out_dir / "README.md", make_readme(run_id, args.config_used))
     write_text(out_dir / "technical_report.md", make_technical_report(run_id, state, decisions, tool_calls))
     write_text(out_dir / "run_record.md", make_run_record(run_id, state, decisions, tool_calls))
+    rows = collect_experiments(run_dir, decisions)
+    write_text(out_dir / "dashboard.html", make_html(run_id, state, decisions, read_jsonl(run_dir / "tool_calls.jsonl"), rows))
     print(json.dumps({"report_dir": str(out_dir), "run_id": run_id}, indent=2))
 
 
