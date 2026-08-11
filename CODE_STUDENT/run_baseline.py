@@ -118,7 +118,8 @@ def build_seed_configs(base_config, seed, baseline_dir):
     eval_config["epsilon_start"] = 0.0
     eval_config["epsilon_end"] = 0.0
     eval_config["epsilon_decay"] = 1.0
-    eval_config["input_q_table"] = f"runs/{baseline_dir.name}/seed_{seed}/train/q_table.npy"
+    baseline_rel = baseline_dir.relative_to(RUNS_DIR).as_posix()
+    eval_config["input_q_table"] = f"runs/{baseline_rel}/seed_{seed}/train/q_table.npy"
 
     seed_dir = baseline_dir / f"seed_{seed}"
     seed_dir.mkdir(parents=True, exist_ok=True)

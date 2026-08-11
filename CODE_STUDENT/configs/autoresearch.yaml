@@ -1,0 +1,64 @@
+goal_file: goals/default_goal.md
+
+planner:
+  type: rules
+  provider: disabled
+  model: null
+  api_key_env: null
+  timeout_seconds: 60
+  local_endpoint: null
+
+budget:
+  max_iterations: 3
+  max_wall_time_minutes: 30
+  seeds: [42, 123, 2026]
+  training_episodes: 1
+  evaluation_episodes: 1
+  save_every: 1
+
+objective:
+  primary_metric: mean_score
+  diagnostic_metrics: [mean_reward, std_score, total_training_time]
+  direction: maximize
+  min_improvement: 0.0
+
+base_experiment:
+  render: false
+  input_q_table: data/q_tables/Qvals.npy
+  q_init: heuristic
+  fps_train: 1500
+  fps_eval: 1500
+  learning_rate: 0.6
+  learning_rate_min: 0.1
+  learning_rate_decay: 0.9995
+  discount_factor: 0.95
+  epsilon_start: 0.001
+  epsilon_end: 0.001
+  epsilon_decay: 1.0
+  sample_t: 3
+  state_discretization:
+    dx_dy_bin_size: 25
+    velocity_bin_size: 2
+  rewards:
+    pipe_passed: 10
+    alive: 0.05
+    death: -50
+  environment:
+    player_flap_acc: -10
+
+search_space:
+  learning_rate: [0.3, 0.4, 0.6, 0.7]
+  epsilon_start: [0.0, 0.001, 0.01, 0.05]
+  epsilon_end: [0.0, 0.001]
+  epsilon_decay: [0.99, 0.995, 1.0]
+  discount_factor: [0.9, 0.95, 0.99]
+  sample_t: [2, 3, 4]
+  rewards.alive: [0.02, 0.05, 0.1]
+
+constraints:
+  forbid_source_edits: true
+  forbid_state_space_expansion: true
+  eval_epsilon_must_be_zero: true
+
+failure_demo:
+  enabled: true

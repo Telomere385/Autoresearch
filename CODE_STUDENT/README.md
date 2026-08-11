@@ -58,3 +58,35 @@ runs/<run_id>/
   rewards.npy
   average_rewards.npy
 ```
+
+## Mini AutoResearch Agent
+
+Run the default offline AutoResearch loop with the rules planner:
+
+```powershell
+python run_autoresearch.py --config configs/autoresearch.yaml
+```
+
+The default configuration uses:
+
+- `planner.type: rules`
+- `planner.provider: disabled`
+- 3 real experiment iterations
+- 3 seeds per iteration
+- headless training and evaluation
+
+Outputs are written under `runs/autoresearch_<timestamp>/`:
+
+```text
+state.json
+decisions.jsonl
+planner_calls.jsonl
+tool_calls.jsonl
+errors.jsonl
+report.md
+iteration_001/
+iteration_002/
+iteration_003/
+```
+
+The optional LLM planner is configured through `configs/autoresearch.yaml` with `provider: openai`, `anthropic`, or `local`. LLM output is limited to structured candidate parameter changes and is validated against `search_space` before any experiment runs.
