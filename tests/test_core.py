@@ -1,3 +1,5 @@
+"""Unit and end-to-end tests for the AutoResearch agent harness."""
+
 import io
 import json
 from pathlib import Path
@@ -17,19 +19,49 @@ from autoresearch.report import validate_report
 from autoresearch.tooling import ToolHarness
 
 
+VALID_REPORT = """# Research Goal
+Improve the score through bounded, real experiments.
+
+## Plan
+Measure a baseline, run three candidates, recover from regression, and report evidence.
+
+## Baseline
+The baseline score was 5.0.
+
+## Experiment Process
+Iteration 1 scored 4.0 and was rejected. Iteration 2 scored 6.0 and was accepted.
+Iteration 3 scored 7.0 and was accepted.
+
+## Failure and Recovery
+Iteration 1 regressed; snapshot rollback and recovery were verified before continuing.
+
+## Best Result
+The best score was 7.0 from Iteration 3.
+
+## Limitations
+This bounded single-seed experiment is not a statistical performance claim.
+"""
+
+
 class CoreTests(unittest.TestCase):
+    """Verify planner transport, validation, progress, and safety boundaries."""
+
     def test_openai_sdk_transport_preserves_kimi_fields_and_configuration(self):
-        payload = {
-            "choices": [{"message": {
-                "role": "assistant", "content": None,
-                "reasoning_content": "inspect before acting",
-                "tool_calls": [{
-                    "id": "call_sdk", "type": "function",
-                    "function": {"name": "read_file", "arguments": '{"path":"goal.md"}'},
-                }],
-            }}],
-            "usage": {"total_tokens": 12},
-        }
+        """Ensure SDK serialization preserves provider-specific reasoning data."""
+        payload = ChatCompletion.model_validate({
+            "id": "test", "object": "chat.completion", "created": 0,
+            "model": "kimi/kimi-k3", "choices": [{
+                "index": 0, "finish_reason": "tool_calls", "message": {
+                    "role": "assistant", "content": None,
+                    "reasoning_content": "inspect before acting",
+                    "tool_calls": [{
+                        "id": "call_sdk", "type": "function",
+                        "function": {"name": "read_file", "arguments": '{"path":"goal.md"}'},
+                    }],
+                },
+            }],
+            "usage": {"completion_tokens": 5, "prompt_tokens": 7, "total_tokens": 12},
+        }).model_dump(mode="json")
         factory = FakeOpenAIClientFactory(payload)
         config = {
             "provider": "openai_compatible", "model": "kimi/kimi-k3",
@@ -52,6 +84,7 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(factory.create_kwargs["tool_choice"], "required")
 
     def test_progress_reporter_heartbeats_and_never_prints_file_content(self):
+        """Ensure progress remains live without leaking written file contents."""
         stream = io.StringIO()
         reporter = ProgressReporter("normal", stream=stream, heartbeat_interval=0.01)
         reporter.emit("FILE", "read task/config.yaml lines 1-10")
@@ -70,6 +103,7 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(quiet_stream.getvalue(), "")
 
     def test_native_tool_call_parsing_and_reasoning_replay(self):
+        """Validate native tool arguments and reasoning-content replay fields."""
         message = _normalize_assistant_message({
             "content": None,
             "reasoning_content": "inspect first",
@@ -85,25 +119,8 @@ class CoreTests(unittest.TestCase):
         with self.assertRaises(PlannerError):
             parse_tool_call({"id": "bad", "function": {"name": "x", "arguments": "{"}})
 
-    def test_openai_sdk_model_retains_dashscope_reasoning_content(self):
-        sdk_response = ChatCompletion.model_validate({
-            "id": "test", "object": "chat.completion", "created": 0,
-            "model": "kimi/kimi-k3", "choices": [{
-                "index": 0, "finish_reason": "tool_calls", "message": {
-                    "role": "assistant", "content": None,
-                    "reasoning_content": "provider reasoning",
-                    "tool_calls": [{
-                        "id": "call_1", "type": "function",
-                        "function": {"name": "read_file", "arguments": "{}"},
-                    }],
-                },
-            }],
-        }).model_dump(mode="json")
-        message = sdk_response["choices"][0]["message"]
-        self.assertEqual(message["reasoning_content"], "provider reasoning")
-        self.assertEqual(message["tool_calls"][0]["function"]["name"], "read_file")
-
     def test_runtime_requires_three_iterations_and_native_llm(self):
+        """Enforce the minimum experiment count and supported LLM provider."""
         config = load_yaml(Path(__file__).resolve().parents[1] / "configs" / "autoresearch.yaml")
         config["budget"]["min_iterations"] = 2
         with self.assertRaisesRegex(ValueError, "at least 3"):
@@ -114,6 +131,7 @@ class CoreTests(unittest.TestCase):
             _validate_runtime_config(config)
 
     def test_execution_verification_and_comparison_are_independent(self):
+        """Ensure deterministic checks can reject misleading experiment output."""
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "metrics.json"
             path.write_text(json.dumps({"status": "success", "score": 2.0}), encoding="utf-8")
@@ -125,6 +143,7 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(decision, "reject")
 
     def test_report_validator_rejects_missing_evidence(self):
+        """Reject reports that omit required sections and iteration evidence."""
         with tempfile.TemporaryDirectory() as temporary:
             report = Path(temporary) / "report.md"
             report.write_text("# Best Result\nscore 7.0", encoding="utf-8")
@@ -137,6 +156,7 @@ class CoreTests(unittest.TestCase):
             self.assertTrue(any("Iteration 1" in error for error in errors))
 
     def test_harness_rejects_out_of_run_writes_and_early_finish(self):
+        """Enforce run-scoped writes and completion requirements."""
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             run_dir = root / "runs" / "safe_run"
@@ -163,13 +183,18 @@ class CoreTests(unittest.TestCase):
 
 
 class AgentIntegrationTests(unittest.TestCase):
+    """Exercise the complete LLM-to-tool state machine with real subprocesses."""
+
     def test_llm_plans_and_uses_real_file_and_shell_tools_for_three_iterations(self):
+        """Run baseline plus three candidates, including verified rollback."""
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             (root / "configs").mkdir()
             (root / "task").mkdir()
             (root / "runs").mkdir()
             (root / "task" / "goal.md").write_text("Improve score with real experiments.", encoding="utf-8")
+            # The temporary experiment is intentionally small but executes as a
+            # real child process and writes the same artifact shape as a task.
             script = root / "task" / "experiment.py"
             script.write_text(textwrap.dedent("""
                 import argparse
@@ -206,7 +231,8 @@ class AgentIntegrationTests(unittest.TestCase):
                 {"id": "recovery", "description": "Recover from a real negative result", "expected_tools": ["restore_snapshot"], "success_signal": "Verified rollback"},
                 {"id": "report", "description": "Write and validate final report", "expected_tools": ["write_file", "finish"], "success_signal": "Report accepted"},
             ]
-            report = _complete_report()
+            # Scripted decisions isolate harness behavior from network/model
+            # variability while preserving the native function-calling flow.
             actions = [
                 ("submit_plan", {"goal_summary": "Improve score through measured iterations", "steps": plan_steps, "risks": ["candidate may regress"]}),
                 ("read_file", {"path": "configs/runtime.yaml", "start_line": 1, "max_lines": 200}),
@@ -226,7 +252,7 @@ class AgentIntegrationTests(unittest.TestCase):
                 ("run_command", _run_args(run_id, "candidate", 3, "Test another higher rate")),
                 ("evaluate_result", {"iteration": 3, "decision": "accept", "reason": "Score improved again", "evidence": "7.0 is above 6.0"}),
                 ("update_plan", _plan_update("experiments", "Three candidates evaluated", "Write the report")),
-                ("write_file", {"path": f"{run_prefix}/report.md", "content": report}),
+                ("write_file", {"path": f"{run_prefix}/report.md", "content": VALID_REPORT}),
                 ("update_plan", _plan_update("report", "Report written with all required evidence", "Finish")),
                 ("finish", {"summary": "Completed three real candidates with a verified rollback", "report_path": f"{run_prefix}/report.md"}),
             ]
@@ -257,12 +283,15 @@ class AgentIntegrationTests(unittest.TestCase):
 
 
 class ScriptedLLM:
+    """Deterministic chat substitute that emits a predefined tool-call trace."""
+
     def __init__(self, actions):
         self.actions = list(actions)
         self.index = 0
         self.reasoning_was_replayed = False
 
     def __call__(self, messages, _tools, _config, tool_choice):
+        """Return the next tool call and verify prior reasoning was replayed."""
         if self.index and any(message.get("reasoning_content") == "choose a real tool" for message in messages):
             self.reasoning_was_replayed = True
         if tool_choice != "required" or self.index >= len(self.actions):
@@ -279,30 +308,30 @@ class ScriptedLLM:
         return message, {"choices": [{"message": message}], "usage": {"total_tokens": 1}}
 
 
-class FakeCompletion:
-    def __init__(self, payload):
-        self.payload = payload
-
-    def model_dump(self, mode):
-        if mode != "json":
-            raise AssertionError("Expected JSON serialization")
-        return self.payload
-
-
 class FakeOpenAIClientFactory:
+    """Capture OpenAI SDK client and completion arguments without networking."""
+
     def __init__(self, payload):
         self.payload = payload
         self.client_kwargs = None
         self.create_kwargs = None
 
     def __call__(self, **kwargs):
+        """Build the minimal nested client surface consumed by planner.chat."""
         self.client_kwargs = kwargs
         factory = self
 
         class Completions:
             def create(self, **create_kwargs):
                 factory.create_kwargs = create_kwargs
-                return FakeCompletion(factory.payload)
+
+                class Completion:
+                    def model_dump(self, mode):
+                        if mode != "json":
+                            raise AssertionError("Expected JSON serialization")
+                        return factory.payload
+
+                return Completion()
 
         class Chat:
             completions = Completions()
@@ -314,6 +343,7 @@ class FakeOpenAIClientFactory:
 
 
 def _integration_config():
+    """Return a complete, bounded runtime configuration for integration tests."""
     return {
         "goal_file": "task/goal.md",
         "planner": {"provider": "openai_compatible", "model": "test-model"},
@@ -339,6 +369,7 @@ def _integration_config():
 
 
 def _run_args(run_id, kind, iteration, hypothesis):
+    """Build a valid run_command payload for the temporary experiment."""
     label = "baseline" if kind == "baseline" else f"iteration_{iteration:02d}"
     return {
         "argv": [
@@ -351,34 +382,5 @@ def _run_args(run_id, kind, iteration, hypothesis):
 
 
 def _plan_update(step_id, evidence, next_action):
+    """Build a completed update_plan payload with supporting evidence."""
     return {"step_id": step_id, "status": "completed", "evidence": evidence, "next_action": next_action}
-
-
-def _complete_report():
-    return """# Research Goal
-Improve the measured score through bounded, real subprocess experiments.
-
-## Plan
-Inspect inputs, establish a baseline, run three candidates, recover from regression, and report evidence.
-
-## Baseline
-The baseline score was 5.0 using learning_rate 0.5.
-
-## Experiment Process
-Iteration 1 used learning_rate 0.4 and measured score 4.0, so it was rejected.
-Iteration 2 used learning_rate 0.6 and measured score 6.0, so it was accepted.
-Iteration 3 used learning_rate 0.7 and measured score 7.0, so it was accepted.
-
-## Failure and Recovery
-Iteration 1 was a real metric regression. The Agent requested rollback and the harness restored and verified iteration_01_before.yaml before continuing.
-
-## Best Result
-The best measured score was 7.0 from Iteration 3.
-
-## Limitations
-This small demonstration uses one deterministic metric and a bounded search space, so it is not a statistical performance claim.
-"""
-
-
-if __name__ == "__main__":
-    unittest.main()

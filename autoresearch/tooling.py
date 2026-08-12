@@ -1,3 +1,5 @@
+"""Tool schemas and guarded implementations exposed to the research planner."""
+
 import copy
 import hashlib
 import json
@@ -70,7 +72,15 @@ def tool_schemas():
 
 
 class ToolHarness:
+    """Execute planner-requested tools within run-scoped safety boundaries.
+
+    The harness owns deterministic validation and state transitions. The LLM
+    proposes actions and interpretations, but cannot bypass path, command,
+    budget, metric, rollback, or completion checks enforced here.
+    """
+
     def __init__(self, root, run_dir, config, state, reporter=None):
+        """Bind tool execution to one workspace root and one writable run dir."""
         self.root = Path(root).resolve()
         self.run_dir = Path(run_dir).resolve()
         self.config = config
@@ -88,6 +98,7 @@ class ToolHarness:
         self.read_roots = self._read_roots()
 
     def execute(self, name, arguments, call_dir):
+        """Dispatch one tool call and convert expected failures to observations."""
         call_dir = Path(call_dir)
         try:
             if not self.state.get("plan") and name != "submit_plan":
@@ -124,6 +135,7 @@ class ToolHarness:
         return result
 
     def _tool_submit_plan(self, args, _call_dir):
+        """Validate and persist the LLM's initial multi-step research plan."""
         steps = args.get("steps")
         if self.state.get("plan"):
             raise ToolError("A plan has already been submitted; use update_plan")
@@ -155,6 +167,7 @@ class ToolHarness:
         return {"plan_path": self._display(self.run_dir / "plan.json"), "step_count": len(steps)}
 
     def _tool_update_plan(self, args, _call_dir):
+        """Update one plan step with evidence and an explicit next action."""
         step_id = str(args.get("step_id", ""))
         for step in self.state["plan"]["steps"]:
             if step["id"] == step_id:
@@ -167,6 +180,7 @@ class ToolHarness:
         raise ToolError(f"Unknown plan step: {step_id}")
 
     def _tool_list_files(self, args, _call_dir):
+        """List bounded file metadata under an approved read root."""
         directory = self._resolve_read(args["path"])
         if not directory.is_dir():
             raise ToolError(f"Not a directory: {args['path']}")
@@ -182,6 +196,7 @@ class ToolHarness:
         return {"files": files, "truncated": len(files) >= limit}
 
     def _tool_read_file(self, args, _call_dir):
+        """Read a bounded UTF-8 slice without crossing approved read roots."""
         path = self._resolve_read(args["path"])
         if not path.is_file():
             raise ToolError(f"Not a file: {args['path']}")
@@ -209,6 +224,7 @@ class ToolHarness:
         }
 
     def _tool_write_file(self, args, _call_dir):
+        """Write a size-bounded UTF-8 artifact inside the current run only."""
         path = self._resolve_write(args["path"])
         content = args.get("content")
         if not isinstance(content, str):
@@ -225,6 +241,11 @@ class ToolHarness:
         }
 
     def _tool_run_command(self, args, call_dir):
+        """Run one validated baseline or candidate experiment subprocess.
+
+        Candidate runs receive a pre-experiment snapshot and remain pending
+        until the planner submits an evaluation and, when needed, a rollback.
+        """
         if self.state.get("pending_run"):
             raise ToolError("Evaluate and, if required, restore the pending experiment first")
         kind = args.get("experiment_kind")
@@ -258,6 +279,8 @@ class ToolHarness:
             iteration = self.state["iteration"]
             artifact_dir = self.run_dir / f"iteration_{iteration:02d}"
             artifact_dir.mkdir(parents=True, exist_ok=False)
+            # Snapshot the last accepted configuration before executing an
+            # untrusted candidate so rollback is deterministic and verifiable.
             snapshot_id = f"iteration_{iteration:02d}_before.yaml"
             snapshot_path = self.run_dir / "snapshots" / snapshot_id
             snapshot_path.parent.mkdir(parents=True, exist_ok=True)
@@ -351,11 +374,14 @@ class ToolHarness:
         }
 
     def _tool_evaluate_result(self, args, _call_dir):
+        """Reconcile the LLM decision with independent metric validation."""
         pending = self.state.get("pending_run")
         if not pending or pending["iteration"] != int(args["iteration"]):
             raise ToolError("No matching candidate experiment is awaiting evaluation")
         if pending.get("evaluation"):
             raise ToolError("The pending experiment has already been evaluated")
+        # Tool output is evidence, not truth: the harness derives its own
+        # decision from process status and persisted metrics.
         if pending["verification_errors"]:
             harness_decision = "rollback"
             harness_reason = "; ".join(pending["verification_errors"])
@@ -395,6 +421,7 @@ class ToolHarness:
         }
 
     def _tool_restore_snapshot(self, args, _call_dir):
+        """Restore and read-back verify the accepted pre-candidate snapshot."""
         pending = self.state.get("pending_run")
         if not pending or not pending.get("evaluation"):
             raise ToolError("No evaluated candidate is awaiting restoration")
@@ -424,6 +451,7 @@ class ToolHarness:
         return {"restored": True, "verified": True, "recovery": recovery, "next_action": "reflect and plan a different candidate"}
 
     def _tool_finish(self, args, _call_dir):
+        """Complete the run only after plan, experiment, recovery, and report checks."""
         if self.state.get("pending_run"):
             raise ToolError("Resolve the pending experiment before finishing")
         incomplete_steps = [
@@ -456,6 +484,7 @@ class ToolHarness:
         return {"finished": True, "status": "completed", "report_path": self._display(report_path)}
 
     def _finalize_pending(self, decision, recovery):
+        """Move a resolved candidate from pending state into immutable history."""
         pending = self.state["pending_run"]
         item = {
             "iteration": pending["iteration"], "hypothesis": pending["hypothesis"],
@@ -468,6 +497,7 @@ class ToolHarness:
         self.state["pending_run"] = None
 
     def _validate_command(self, args, kind):
+        """Restrict subprocess execution to the configured experiment protocol."""
         argv = args.get("argv")
         if not isinstance(argv, list) or len(argv) < 2 or not all(isinstance(x, str) for x in argv):
             raise ToolError("argv must be a non-empty string array")
@@ -498,6 +528,7 @@ class ToolHarness:
         return [sys.executable, str(requested_script), *argv[2:]], requested_id
 
     def _bounded_timeout(self, requested):
+        """Clamp a tool timeout to experiment and remaining wall-time budgets."""
         maximum = self.state["limits"]["experiment_timeout_seconds"]
         elapsed = time.time() - self.state["started_unix"]
         wall_remaining = self.state["limits"]["max_wall_time_minutes"] * 60 - elapsed
@@ -508,6 +539,7 @@ class ToolHarness:
         return min(requested, maximum, max(0.1, wall_remaining))
 
     def _read_roots(self):
+        """Resolve the configured read allowlist for this run."""
         configured = self.config.get("tools", {}).get(
             "read_roots", ["tasks", "configs", f"runs/{self.state['run_id']}"]
         )
@@ -521,6 +553,7 @@ class ToolHarness:
         return roots
 
     def _resolve_read(self, value):
+        """Resolve a requested read path and enforce the read allowlist."""
         path = Path(str(value))
         resolved = (self.root / path).resolve() if not path.is_absolute() else path.resolve()
         if not self._is_readable(resolved):
@@ -528,10 +561,12 @@ class ToolHarness:
         return resolved
 
     def _is_readable(self, path):
+        """Return whether a path is contained by any approved read root."""
         resolved = Path(path).resolve()
         return any(_within(resolved, root) for root in self.read_roots)
 
     def _resolve_write(self, value):
+        """Resolve a write target and enforce run-directory containment."""
         path = Path(str(value))
         resolved = (self.root / path).resolve() if not path.is_absolute() else path.resolve()
         if not _within(resolved, self.write_root):
@@ -539,6 +574,7 @@ class ToolHarness:
         return resolved
 
     def _display(self, path):
+        """Format a path relative to the workspace when possible."""
         try:
             return Path(path).resolve().relative_to(self.root).as_posix()
         except ValueError:
@@ -546,10 +582,11 @@ class ToolHarness:
 
 
 class ToolError(RuntimeError):
-    pass
+    """Represent a recoverable, LLM-visible tool validation error."""
 
 
 def _tool(name, description, properties, required):
+    """Build an OpenAI function-tool schema with strict object arguments."""
     return {"type": "function", "function": {
         "name": name, "description": description,
         "parameters": {"type": "object", "properties": properties, "required": required, "additionalProperties": False},
@@ -561,6 +598,7 @@ def _string():
 
 
 def _required_text(mapping, key):
+    """Return a stripped required string or raise a tool validation error."""
     value = mapping.get(key)
     if not isinstance(value, str) or not value.strip():
         raise ToolError(f"{key} must be a non-empty string")
@@ -568,6 +606,7 @@ def _required_text(mapping, key):
 
 
 def _within(path, root):
+    """Return whether a resolved path is contained by a resolved root."""
     try:
         Path(path).resolve().relative_to(Path(root).resolve())
         return True
@@ -576,6 +615,7 @@ def _within(path, root):
 
 
 def _sha256(path):
+    """Hash a file for write and rollback verification records."""
     digest = hashlib.sha256()
     with Path(path).open("rb") as handle:
         for block in iter(lambda: handle.read(65536), b""):
@@ -584,6 +624,7 @@ def _sha256(path):
 
 
 def _argument_after(argv, flag):
+    """Extract a required value from a validated argument vector."""
     try:
         return argv[argv.index(flag) + 1]
     except (ValueError, IndexError) as exc:
@@ -591,6 +632,7 @@ def _argument_after(argv, flag):
 
 
 def _config_changes(before, after, prefix=""):
+    """Return leaf-level configuration changes keyed by dotted paths."""
     changes = {}
     keys = set(before) | set(after)
     for key in keys:
@@ -605,6 +647,7 @@ def _config_changes(before, after, prefix=""):
 
 
 def _validate_changes(changes, search_space):
+    """Validate candidate changes against the configured search space."""
     errors = []
     for key, value in changes.items():
         if key not in search_space:
@@ -615,10 +658,12 @@ def _validate_changes(changes, search_space):
 
 
 def _yaml_text(data):
+    """Serialize configuration data with stable key ordering."""
     import yaml
     return yaml.safe_dump(data, sort_keys=False)
 
 
 def _decode_timeout(value):
+    """Normalize timeout-captured subprocess output to text."""
     value = value or ""
     return value.decode("utf-8", errors="replace") if isinstance(value, bytes) else value

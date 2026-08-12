@@ -1,3 +1,5 @@
+"""OpenAI-compatible planner transport and native tool-call parsing."""
+
 import json
 import os
 
@@ -6,11 +8,15 @@ from openai import OpenAI
 
 
 class PlannerError(RuntimeError):
-    pass
+    """Represent a recoverable planner request or response error."""
 
 
 def chat(messages, tools, config, tool_choice="required", reporter=None, client_factory=OpenAI):
-    """Call an OpenAI-compatible model through the official Python SDK."""
+    """Call an OpenAI-compatible model through the official Python SDK.
+
+    The returned assistant message is normalized for replay, while the raw SDK
+    payload is retained so the agent can persist a complete execution record.
+    """
     if config.get("provider", "openai_compatible") != "openai_compatible":
         raise PlannerError("Only the openai_compatible LLM provider is supported")
     api_key_env = config.get("api_key_env", "OPENAI_API_KEY")
@@ -49,6 +55,7 @@ def chat(messages, tools, config, tool_choice="required", reporter=None, client_
 
 
 def _sdk_error_detail(exc):
+    """Build a bounded diagnostic string without exposing request secrets."""
     parts = [type(exc).__name__]
     status_code = getattr(exc, "status_code", None)
     request_id = getattr(exc, "request_id", None)
@@ -63,6 +70,7 @@ def _sdk_error_detail(exc):
 
 
 def _normalize_assistant_message(message):
+    """Preserve the assistant fields required by subsequent chat turns."""
     if not isinstance(message, dict):
         raise PlannerError("LLM assistant message is not an object")
     normalized = {
@@ -80,6 +88,7 @@ def _normalize_assistant_message(message):
 
 
 def parse_tool_call(tool_call):
+    """Decode one native function call into its id, name, and argument mapping."""
     try:
         call_id = str(tool_call["id"])
         function = tool_call["function"]

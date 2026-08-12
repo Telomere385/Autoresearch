@@ -1,3 +1,5 @@
+"""Evidence-based validation for final reports authored by the research agent."""
+
 from pathlib import Path
 
 

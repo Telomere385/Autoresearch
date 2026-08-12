@@ -1,3 +1,5 @@
+"""Thread-safe terminal progress events for long-running agent operations."""
+
 from contextlib import contextmanager
 from datetime import datetime
 import sys
@@ -18,9 +20,11 @@ class ProgressReporter:
 
     @property
     def enabled(self):
+        """Return whether progress output is enabled for this reporter."""
         return self.mode != "quiet"
 
     def emit(self, event, message, *, verbose=False):
+        """Write one timestamped event, respecting quiet and verbose modes."""
         if not self.enabled or (verbose and self.mode != "verbose"):
             return
         timestamp = datetime.now().strftime("%H:%M:%S")
@@ -73,6 +77,7 @@ def tool_summary(name, arguments):
 
 
 def _after(values, flag):
+    """Return the argument following a CLI flag, or an empty string."""
     try:
         return str(values[values.index(flag) + 1])
     except (ValueError, IndexError):

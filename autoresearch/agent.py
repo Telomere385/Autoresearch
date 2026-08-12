@@ -1,3 +1,5 @@
+"""Core LLM-driven control loop for iterative machine-learning experiments."""
+
 import copy
 from datetime import datetime, timezone
 import json
@@ -19,7 +21,12 @@ def run_agent(
     config_path, run_id=None, goal=None, *, chat_fn=None, root=None, runs_root=None,
     reporter=None, progress_mode="normal",
 ):
-    """Run a native function-calling research agent until finish or a safety limit."""
+    """Run the function-calling research agent until finish or a safety limit.
+
+    Every LLM request, assistant response, tool call, state transition, and
+    terminal outcome is persisted under a unique run directory for replay and
+    auditability.
+    """
     root = Path(root or ROOT).resolve()
     runs_root = Path(runs_root or (root / "runs")).resolve()
     config_path = _root_path(config_path, root)
@@ -73,6 +80,8 @@ def run_agent(
             state["agent_steps"] = state["llm_call_count"]
             llm_dir = run_dir / "llm_calls" / f"call_{state['llm_call_count']:03d}"
             llm_dir.mkdir(parents=True)
+            # Persist the exact model context before the network call so a
+            # stalled or failed request remains diagnosable after termination.
             request_body = {
                 "model": config["planner"]["model"], "messages": messages,
                 "tools": schemas, "tool_choice": "required", "parallel_tool_calls": False,
@@ -216,6 +225,7 @@ def run_agent(
 
 
 def _initial_state(run_id, goal, config):
+    """Create the serializable state machine for a new research run."""
     budget = config["budget"]
     return {
         "run_id": run_id, "status": "running", "phase": "planning", "goal": goal,
@@ -242,6 +252,7 @@ def _initial_state(run_id, goal, config):
 
 
 def _system_prompt(root, run_dir, config, state):
+    """Build the policy and experiment protocol supplied to the planner."""
     relative_run = run_dir.relative_to(root).as_posix()
     script = config["experiment"]["command"][1]
     timeout = state["limits"]["experiment_timeout_seconds"]
@@ -272,6 +283,7 @@ Use one tool call per assistant turn. Never claim a tool ran unless its tool res
 
 
 def _safety_stop_reason(state):
+    """Return the first exhausted safety budget, if any."""
     if state["tool_call_count"] >= state["limits"]["max_tool_calls"]:
         return "tool_call_budget_exhausted"
     if state["consecutive_failures"] >= state["limits"]["max_consecutive_failures"]:
@@ -283,6 +295,7 @@ def _safety_stop_reason(state):
 
 
 def _validate_runtime_config(config):
+    """Validate required sections and enforce minimum harness guarantees."""
     required = ("goal_file", "planner", "budget", "experiment", "objective", "baseline", "search_space", "tools")
     missing = [key for key in required if key not in config]
     if missing:
@@ -326,11 +339,13 @@ def _validate_runtime_config(config):
 
 
 def _validate_run_id(run_id):
+    """Reject run identifiers that could escape the configured runs root."""
     if not isinstance(run_id, str) or not run_id.strip() or Path(run_id).name != run_id or run_id in {".", ".."}:
         raise ValueError("run_id must be one directory name without path separators")
 
 
 def _refresh_requirements(state, config):
+    """Recompute completion evidence and remaining budgets in persisted state."""
     recovery_required = config.get("evidence", {}).get("require_recovery_event", True)
     recovery_observed = any(
         item.get("qualifies") and item.get("type") == "experiment_rollback"
@@ -349,6 +364,7 @@ def _refresh_requirements(state, config):
 
 
 def _record_llm_failure(state, path, exc):
+    """Record a recoverable LLM failure and advance failure counters."""
     state["consecutive_failures"] += 1
     state["total_failures"] += 1
     failure = {

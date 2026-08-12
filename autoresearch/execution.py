@@ -1,3 +1,5 @@
+"""Configuration I/O and independent experiment-result validation utilities."""
+
 import json
 import math
 from pathlib import Path
@@ -6,6 +8,7 @@ import yaml
 
 
 def load_yaml(path):
+    """Load a YAML mapping and reject scalar or sequence root values."""
     data = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
     if not isinstance(data, dict):
         raise ValueError(f"YAML file must contain an object: {path}")
@@ -13,20 +16,24 @@ def load_yaml(path):
 
 
 def write_yaml(path, data):
+    """Serialize data as UTF-8 YAML, creating parent directories as needed."""
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     Path(path).write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
 
 
 def write_json(path, data):
+    """Serialize data as indented UTF-8 JSON for auditable run artifacts."""
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     Path(path).write_text(json.dumps(data, indent=2), encoding="utf-8")
 
 
 def fingerprint(config):
+    """Return a deterministic representation used to detect repeated configs."""
     return json.dumps(config, sort_keys=True, separators=(",", ":"))
 
 
 def verify_execution(returncode, timed_out, metrics_path, objective):
+    """Validate process status and metric evidence independently of the LLM."""
     errors = []
     if timed_out:
         errors.append("experiment timed out")
@@ -60,6 +67,7 @@ def verify_execution(returncode, timed_out, metrics_path, objective):
 
 
 def compare_metrics(candidate, best, objective):
+    """Decide whether candidate metrics improve on the current best result."""
     metric = objective["metric"]
     direction = objective.get("direction", "maximize")
     minimum = float(objective.get("min_improvement", 0.0))
@@ -85,6 +93,7 @@ def compare_metrics(candidate, best, objective):
 
 
 def _require_numeric_metric(metrics, name):
+    """Raise when a tie-breaker metric is absent or non-finite."""
     if name not in metrics:
         raise ValueError(f"Tie-breaker metric is missing: {name}")
     value = float(metrics[name])
