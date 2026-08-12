@@ -10,8 +10,9 @@ planner:
   temperature: 0.2
 
 budget:
-  max_iterations: 3
-  max_agent_steps: 6
+  min_iterations: 3
+  max_iterations: 5
+  max_tool_calls: 40
   max_consecutive_failures: 3
   max_wall_time_minutes: 30
   experiment_timeout_seconds: 300
@@ -73,3 +74,17 @@ search_space:
   discount_factor: [0.9, 0.95, 0.99]
   sample_t: [2, 3, 4]
   rewards.alive: [0.02, 0.05, 0.1]
+
+evidence:
+  require_recovery_event: true
+
+tools:
+  read_roots:
+    - tasks/flappy_qlearning
+    - configs
+    - runs/{run_id}
+  write_root: runs/{run_id}
+  allowed_commands:
+    - python tasks/flappy_qlearning/run.py
+  max_read_lines: 500
+  max_output_chars: 12000

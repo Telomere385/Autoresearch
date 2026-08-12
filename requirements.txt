@@ -1,3 +1,9 @@
-numpy
-pygame
-PyYAML
+# Flappy Bird Q-learning experiment
+numpy>=1.24,<3
+pygame>=2.6,<3
+
+# Agent/runtime YAML configuration
+PyYAML>=6,<7
+
+# pygame 2.6.x imports pkg_resources at runtime
+setuptools<81

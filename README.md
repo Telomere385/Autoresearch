@@ -1,129 +1,151 @@
-# Mini AutoResearch
+# Mini AutoResearch Agent Harness
 
-This repository contains a small research agent for iterating real Flappy Bird Q-learning experiments. The LLM chooses only the next bounded hyperparameter change. Python validates the proposal, edits the active YAML, runs the task, validates metrics, compares results, and accepts or rolls back the candidate.
+This repository implements a small LLM Agent that improves a real Flappy Bird Q-learning experiment. The LLM receives a natural-language goal, creates a multi-step plan, selects native function tools, edits run-local configuration, launches Python subprocesses, inspects metrics and logs, decides whether to accept or roll back each candidate, and writes the final report.
 
-## Structure
-
-```text
-main.py                         Single command-line entry point
-autoresearch/agent.py           Complete observe-decide-act-evaluate-update loop
-autoresearch/planner.py         One-experiment LLM request and JSON parsing
-autoresearch/execution.py       Config edits, subprocess execution, validation, comparison
-autoresearch/report.py          Report generated only from persisted state
-configs/autoresearch.yaml       Runtime, model, budget, task, objective, and search configuration
-configs/smoke.yaml              Fast offline verification configuration
-tasks/flappy_qlearning/run.py   Train/evaluate task adapter
-tasks/flappy_qlearning/src/     Existing Flappy Bird Q-learning implementation
-tools/mock_llm_planner.py       State-dependent offline planner for smoke tests
-runs/                           Generated run artifacts
-```
-
-The control loop is intentionally in one file. `state.json` is the canonical state; `trajectory.jsonl` is the append-only event record.
+Python is the harness, not the planner. It executes the requested tools, restricts filesystem and command access, independently validates metrics, verifies rollback snapshots, enforces budgets, and records the complete interaction.
 
 ## Install
 
+Python 3.10 or newer is recommended.
+
 ```powershell
-pip install -r requirements.txt
+python -m pip install -r requirements.txt
 ```
 
-The task runs headlessly. Its code sets the SDL video and audio drivers to `dummy` unless they are already configured.
+The Flappy Bird task sets SDL video and audio drivers to `dummy` for headless execution.
 
 ## Configure
 
-Edit [configs/autoresearch.yaml](configs/autoresearch.yaml). It is the only runtime configuration and contains:
+The default configuration is [configs/autoresearch.yaml](configs/autoresearch.yaml). It contains:
 
-- planner provider, model, base URL, API key environment variable, timeout, and retries
-- goal and experiment command paths
-- experiment, Agent-step, failure, wall-time, and subprocess limits
-- metric, optimization direction, optional target, and tie-breaker
-- baseline experiment and allowed parameter values
+- OpenAI-compatible provider, model, API endpoint, timeout, and retry settings;
+- natural-language goal file, task command, data/Q-table path, and metric path;
+- minimum/maximum candidate experiments, tool-call, failure, wall-time, and subprocess budgets;
+- baseline configuration and allowed candidate parameter values;
+- readable paths, the run-local writable path, and the command allowlist;
+- the requirement for a real failure-and-recovery event.
 
-Secrets are read from the configured environment variable and do not belong in YAML. The default DashScope-compatible setup uses:
+Set the configured API key environment variable:
 
 ```powershell
 $env:DASHSCOPE_API_KEY="your-api-key"
 ```
 
+The default `kimi/kimi-k3` setup uses OpenAI-compatible native Function Calling. The client preserves Kimi's `reasoning_content` in subsequent messages and disables parallel tool calls.
+
 ## Run
 
-Run the real LLM-planned workflow:
+Start the complete workflow with one main command:
 
 ```powershell
-python main.py --config configs/autoresearch.yaml --run-id research_001
+python main.py --config configs/autoresearch.yaml --run-id research_agent_001
 ```
 
-Run the fast offline workflow. The local planner reads the accumulated real history before every proposal; it is not a precomputed sweep.
+Progress is printed live to `stderr` while the final machine-readable result remains on `stdout`:
+
+```text
+[13:41:10] PLAN    submitted 6 steps
+[13:41:20] LLM     call 2 completed in 10.3s, tokens=1842
+[13:41:20] TOOL    call 2 read_file tasks/flappy_qlearning/goal.md
+[13:43:33] EXP     baseline started, timeout=300s
+[13:43:48] EXP     baseline finished in 15.2s, returncode=0, mean_score=5.2
+```
+
+An LLM request or experiment that takes longer than 15 seconds emits a heartbeat every 15 seconds. Use `--quiet` to disable progress or `--verbose` to include API retry and bounded output-tail diagnostics:
 
 ```powershell
-python main.py --config configs/smoke.yaml --run-id smoke_001
+python main.py --config configs/autoresearch.yaml --run-id research_agent_001 --verbose
 ```
 
-Run regression tests:
+Progress never prints API keys, complete prompts, file contents, or full model reasoning.
+
+Override the goal directly from the command line:
+
+```powershell
+python main.py --config configs/autoresearch.yaml --run-id research_agent_002 --goal "在五次实验内提高 mean_score，至少完成三轮候选实验，并记录失败恢复过程"
+```
+
+Every run ID must be new; the Agent never overwrites an existing run.
+
+Run the regression and end-to-end harness tests with:
 
 ```powershell
 python -m unittest discover -s tests -v
 ```
 
-Use a fresh run ID because the Agent refuses to overwrite an existing run.
+The end-to-end test uses a scripted test double only to make protocol assertions deterministic. It still launches three real temporary Python subprocess experiments and derives their metrics from written configurations. The production entry point has no scripted proposals or prewritten experiment results.
 
-## Control Flow
+## Agent and Tool Loop
 
-For every run, `autoresearch.agent.run_agent`:
+The model receives native tool schemas and must call exactly one tool per turn:
 
-1. Loads the goal and the single runtime config.
-2. Writes and executes the baseline configuration.
-3. Builds planner context from canonical state, including all prior outcomes and failures.
-4. Requests and validates one proposal.
-5. Snapshots `current_config.yaml`, applies the candidate, and reads it back.
-6. Executes the configured command with a timeout and captures its exit code and output.
-7. Requires a successful JSON result with a finite configured metric.
-8. Compares candidate and best metrics deterministically.
-9. Keeps an accepted config or restores and verifies the pre-experiment config.
-10. Persists state and trajectory, checks explicit limits, and writes `report.md`.
+- `submit_plan` and `update_plan` create and maintain an explicit multi-step plan;
+- `list_files` and `read_file` inspect the goal, source, configuration, data metadata, logs, and metrics;
+- `write_file` writes only inside `runs/<run_id>/` and records before/after hashes;
+- `run_command` uses `subprocess.run(..., shell=False)` and only permits the configured Python experiment;
+- `evaluate_result` records the LLM's evidence-based accept/rollback decision and compares it with an independent metric check;
+- `restore_snapshot` performs and verifies a requested rollback;
+- `finish` validates minimum iterations, plan completion, recovery evidence, and the LLM-authored report.
 
-Planning and engineering failures consume bounded Agent steps but not real experiment iterations. A worse valid experiment is recorded as rejected and rolled back.
+The baseline is not launched by a hidden Python workflow. The LLM must inspect inputs, write `current_config.yaml`, and call `run_command` itself. Candidate results are not precomputed or hard-coded.
 
-## Artifacts
+At least three candidate experiments are required; the baseline does not count. The default maximum is five so the Agent can obtain real failure/recovery evidence. A normal finish requires a measured candidate regression or failed experiment followed by a verified snapshot rollback. The prompt explicitly forbids intentionally corrupting a command or configuration to manufacture failure. Safety limits can still stop an unhealthy run early.
+
+## Independent Verification
+
+The harness does not assume that a command or LLM conclusion is correct. It checks:
+
+- subprocess timeout and return code;
+- metrics file existence and valid JSON;
+- task `status` and a finite objective metric;
+- candidate changes against the configured search space;
+- duplicate configurations;
+- candidate metrics against the canonical best result;
+- rollback contents by reading back the saved snapshot;
+- final report sections, all iteration references, and the exact best metric value.
+
+An invalid tool request is returned to the model as a real tool error so it can reflect and correct its next action. An improving candidate may be conservatively rolled back by the LLM, but a declining or invalid candidate cannot be accepted against the independent checker.
+
+## Execution Records
+
+Each run is fully auditable:
 
 ```text
 runs/<run_id>/
   run_config.yaml
   current_config.yaml
+  plan.json
   state.json
   trajectory.jsonl
+  messages.jsonl
   report.md
+  llm_calls/call_XXX/
+    request.json
+    response.json
+  tool_calls/call_XXX_<tool>/
+    arguments.json
+    result.json
+  snapshots/
   baseline/
-    config.yaml
     execution.json
     metrics.json
     stdout.log
+    stderr.log
     raw/
-  planning_attempts/step_01/
-    input.json
-    raw_output.txt
-    proposal.json
-    validation.json
   iteration_01/
-    proposal.json
-    before_config.yaml
-    after_config.yaml
-    execution.json
-    metrics.json
-    stdout.log
-    raw/
+  iteration_02/
+  iteration_03/
 ```
 
-The task's detailed train/eval results, Q-table, and logs remain under each `raw/` directory. Reports never fill in missing metrics.
+`messages.jsonl` contains the complete LLM/tool conversation. `trajectory.jsonl` contains decisions, arguments, outputs, errors, recovery actions, and next actions. API keys are read only from the environment and are never persisted.
 
-## Stop Reasons
+## Termination
 
-The persisted stop reason is one of:
+Normal completion uses `agent_finish`. Safety exits include:
 
-- `iteration_budget_exhausted`
-- `agent_step_budget_exhausted`
-- `too_many_failures`
-- `wall_time_budget_exhausted`
-- `target_reached`
-- `unrecoverable_error`
+- `tool_call_budget_exhausted`;
+- `too_many_failures`;
+- `wall_time_budget_exhausted`;
+- `unrecoverable_error`.
 
-Every planner and experiment timeout is bounded. The task adapter returns a non-zero exit code when train/evaluation fails.
+A safety exit before all requirements are met is reported as `failed` or `incomplete_requirements`, never as a successful research result.
