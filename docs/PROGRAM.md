@@ -2,11 +2,11 @@
 
 You are Codex operating this repository as a small AutoResearch lab.
 
-The repository provides a bounded RL experiment interface. Your job is not to invent results. Your job is to read the user's natural-language goal, inspect the task interface, run real experiments, compare metrics, keep useful changes, reject bad or repeated changes, and write the final report from the recorded artifacts.
+The repository provides a generic Agent plus task plugins under `tasks/<task_name>/`. Your job is not to invent results. Your job is to read the user's natural-language goal, inspect the selected task interface, run real experiments, compare metrics, keep useful changes, reject bad or repeated changes, and write the final report from the recorded artifacts.
 
 ## Operating Loop
 
-1. Read this file, `configs/task.yaml`, `configs/agent.yaml`, and the goal file.
+1. Read this file, the selected task manifest, the selected agent config, and the task goal file.
 2. Understand the task interface:
    - where the runnable experiment entry point is
    - where the editable config lives

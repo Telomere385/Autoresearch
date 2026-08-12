@@ -1,0 +1,52 @@
+program_file: docs/PROGRAM.md
+task_file: tasks/template_rl_task/manifest/task.yaml
+goal_file: tasks/template_rl_task/configs/goal.md
+
+planner:
+  type: llm
+  provider: openai
+  model: gpt-4o-mini
+  api_key_env: OPENAI_API_KEY
+  base_url: https://api.openai.com/v1
+  timeout_seconds: 60
+  temperature: 0.2
+  local_endpoint: null
+  local_command: null
+
+budget:
+  max_iterations: 3
+  max_wall_time_minutes: 30
+  seed: 0
+  training_episodes: 10
+  evaluation_episodes: 5
+  save_every: 5
+
+objective:
+  primary_metric: mean_score
+  target_mean_score: 1.0
+  tie_breaker_metric: mean_reward
+  tie_breaker_min_improvement: 0.0
+  diagnostic_metrics: [mean_reward, total_training_time]
+  direction: maximize
+  min_improvement: 0.0
+
+base_experiment:
+  seed: 0
+  training_episodes: 10
+  evaluation_episodes: 5
+
+search_space: {}
+
+constraints:
+  forbid_source_edits: true
+
+failure_demo:
+  enabled: false
+
+version_control:
+  enabled: false
+  auto_commit: false
+  push: false
+  remote: origin
+  branch: null
+  commit_message: null

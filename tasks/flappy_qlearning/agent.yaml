@@ -1,13 +1,16 @@
-program_file: PROGRAM.md
-task_file: configs/task.yaml
-goal_file: goals/default_goal.md
+program_file: docs/PROGRAM.md
+task_file: tasks/flappy_qlearning/task.yaml
+goal_file: tasks/flappy_qlearning/goal.md
 
 planner:
   type: llm
   provider: openai
-  model: gpt-4o-mini
-  api_key_env: OPENAI_API_KEY
+  model: kimi/kimi-k3
+  api_key_env: DASHSCOPE_API_KEY
+  base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
   timeout_seconds: 60
+  max_retries: 3
+  retry_initial_seconds: 2.0
   temperature: 0.2
   local_endpoint: null
   local_command: null
@@ -31,7 +34,7 @@ objective:
 
 base_experiment:
   render: false
-  input_q_table: data/q_tables/Qvals.npy
+  input_q_table: tasks/flappy_qlearning/data/q_tables/Qvals.npy
   q_init: heuristic
   fps_train: 1500
   fps_eval: 1500
@@ -69,4 +72,12 @@ constraints:
   eval_epsilon_must_be_zero: true
 
 failure_demo:
-  enabled: true
+  enabled: false
+
+version_control:
+  enabled: false
+  auto_commit: false
+  push: false
+  remote: origin
+  branch: null
+  commit_message: null

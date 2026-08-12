@@ -1,123 +1,144 @@
 # Mini AutoResearch RL Agent
 
-This repository is a compact AutoResearch-style framework for bounded reinforcement-learning experiments. It is designed to be operated by Codex: the project defines the task interface, editable surface, budget, commands, and artifact format; Codex reads the user's natural-language goal, runs real experiments, evaluates metrics, and writes the final report from recorded artifacts.
+This repository is a small AutoResearch-style framework for interface-clear reinforcement-learning tasks. The included task is `flappy_qlearning`, a Flappy Bird tabular Q-learning experiment.
 
-The included task adapter is Flappy Bird tabular Q-learning.
-
-## Core Files
+## Layout
 
 ```text
-PROGRAM.md              Codex operating protocol.
-configs/task.yaml       Generic RL task interface for the current adapter.
-configs/agent.yaml      LLM planner, budget, objective, and search space.
-configs/experiment.yaml Default task experiment config.
-goals/default_goal.md   Example natural-language goal.
-
-agent.py                AutoResearch controller.
-baseline.py             Single-seed train/eval task runner.
-experiment.py           Single train or eval run.
-visualize.py            HTML dashboard renderer.
-package_report.py       Artifact packager.
-
-planner/
-  llm.py                Structured LLM planner.
-  providers.py          OpenAI, local endpoint, local command providers.
-
-src/flappyq.py          Current RL environment and Q-learning implementation.
-data/q_tables/Qvals.npy Initial Q-table for the current task.
+agent.py                 Main AutoResearch loop.
+planner/                 LLM planner and provider adapters.
+scripts/                 Maintenance CLIs for onboarding, reports, and Git helpers.
+tasks/flappy_qlearning/  Runnable Flappy Q-learning task.
+tasks/template_rl_task/  Template for adding another task.
+docs/                    Operating protocol and project notes.
+runs/                    Generated experiment outputs.
+reports/                 Generated dashboards and packages.
 ```
+
+Legacy files and old experiment outputs should not live in the active tree. Keep reproducible task code under `tasks/`, and keep generated artifacts under `runs/` or `reports/`.
 
 ## Install
 
 ```powershell
 pip install -r requirements.txt
+pip install -r tasks/flappy_qlearning/requirements.txt
 ```
 
-## Run With OpenAI Planner
+## Configure The Planner
+
+For DashScope/Kimi, set the API key in the shell:
 
 ```powershell
-$env:OPENAI_API_KEY="your_api_key"
-python agent.py --config configs/agent.yaml
+$env:DASHSCOPE_API_KEY="your_api_key"
 ```
 
-The LLM may only propose parameter changes from `configs/agent.yaml::search_space`. The Agent validates every candidate before running it.
-
-## No-Network Interface Test
-
-```powershell
-python agent.py --config configs/agent_smoke.yaml
-```
-
-This uses `provider: local_command` and `tools/mock_llm_planner.py`. It tests the same structured planner interface without a remote API call.
-
-## Codex Workflow
-
-When using Codex directly, start from:
+The active task config is:
 
 ```text
-PROGRAM.md
-configs/task.yaml
-configs/agent.yaml
+tasks/flappy_qlearning/agent.yaml
+```
+
+Its planner block should look like:
+
+```yaml
+planner:
+  type: llm
+  provider: openai
+  model: kimi/kimi-k3
+  api_key_env: DASHSCOPE_API_KEY
+  base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+  timeout_seconds: 60
+  max_retries: 3
+  retry_initial_seconds: 2.0
+  temperature: 0.2
+```
+
+`provider: openai` means OpenAI-compatible `/chat/completions`; it is used for DashScope compatible mode as well.
+
+## Run
+
+Use a fresh `--run-id` each time:
+
+```powershell
+python agent.py --task flappy_qlearning --run-id kimi_test_001
+```
+
+Run without network using the mock planner:
+
+```powershell
+python agent.py --task flappy_qlearning --config tasks/flappy_qlearning/agent_smoke.yaml --run-id smoke_001
+```
+
+Generate dashboard and report package:
+
+```powershell
+python scripts/visualize.py --task flappy_qlearning --run-id kimi_test_001
+python scripts/package_report.py --task flappy_qlearning --run-id kimi_test_001
+```
+
+## Add A Task
+
+Place a project under:
+
+```text
+tasks/<task_name>/project/
+```
+
+Generate the task adapter:
+
+```powershell
+$env:DASHSCOPE_API_KEY="your_api_key"
+python scripts/onboard_task.py --task <task_name> --provider openai --model kimi/kimi-k3 --api-key-env DASHSCOPE_API_KEY --base-url https://dashscope.aliyuncs.com/compatible-mode/v1 --force
 ```
 
 Then run:
 
 ```powershell
-python agent.py --config configs/agent.yaml --run-id <run_id>
-python visualize.py --run-id <run_id>
-python package_report.py --run-id <run_id> --config-used configs/agent.yaml
+python agent.py --task <task_name>
 ```
 
-For the final written report, use:
+## Task Contract
+
+Each task must provide one of these layouts:
 
 ```text
-prompts/final_report.md
+tasks/<task_name>/task.yaml
+tasks/<task_name>/agent.yaml
+tasks/<task_name>/config.yaml
+tasks/<task_name>/goal.md
+tasks/<task_name>/run.py
 ```
 
-Codex should read the run artifacts and write `reports/<run_id>/codex_report.md`.
-
-## Outputs
+or:
 
 ```text
-runs/<run_id>/
-  program.md
-  task.yaml
-  config.yaml
-  goal.md
-  state.json
-  decisions.jsonl
-  planner_calls.jsonl
-  tool_calls.jsonl
-  errors.jsonl
-  report.md
-  iteration_001/
-  iteration_002/
-  iteration_003/
-
-reports/<run_id>/
-  dashboard.html
-  README.md
-  technical_report.md
-  run_record.md
-  artifacts/
+tasks/<task_name>/manifest/task.yaml
+tasks/<task_name>/configs/agent.yaml
+tasks/<task_name>/configs/experiment.yaml
+tasks/<task_name>/configs/goal.md
+tasks/<task_name>/runner/run.py
 ```
 
-## Adapting To Another RL Task
+The runner must accept:
 
-To adapt this framework to another interface-clear RL task:
+```powershell
+python <task_runner> --config <candidate_config> --run-id <task>/<run_id>/<phase>
+```
 
-1. Replace or add a task runner equivalent to `baseline.py`.
-2. Ensure the runner accepts `--config` and `--run-id`.
-3. Ensure it writes `runs/<run_id>/summary.json`.
-4. Update `configs/task.yaml` with the command, output paths, metric names, and editable surface.
-5. Update `configs/agent.yaml::base_experiment` and `search_space`.
-6. Keep results in the same JSON artifact format.
+and write:
 
-The controller does not need to know the RL algorithm internals as long as the task adapter follows the interface.
+```text
+runs/<task>/<run_id>/<phase>/summary.json
+```
 
-## Current Limitations
+Minimum summary fields:
 
-- The included adapter is still Flappy Bird Q-learning, not a broad RL benchmark suite.
-- The framework optimizes bounded YAML parameters, not arbitrary source code.
-- Final narrative reports are intended to be written by Codex from artifacts, not treated as scientific claims.
-- Single-seed evaluation is fast and simple but not statistically rigorous.
+```json
+{
+  "status": "success",
+  "mean_score": 0.0,
+  "max_score": 0.0,
+  "mean_reward": 0.0,
+  "total_training_time": 0.0
+}
+```

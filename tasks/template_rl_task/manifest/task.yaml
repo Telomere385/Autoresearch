@@ -1,0 +1,33 @@
+task:
+  name: template_rl_task
+  kind: reinforcement_learning
+  algorithm: replace_me
+  description: Replace with the task description.
+
+interface:
+  experiment_runner: tasks/template_rl_task/runner/run.py
+  default_experiment_config: tasks/template_rl_task/configs/experiment.yaml
+  command_template: >
+    python tasks/template_rl_task/runner/run.py --config {config_path} --run-id {run_id}
+  output:
+    summary_json: runs/{run_id}/summary.json
+
+metrics:
+  primary: mean_score
+  direction: maximize
+  diagnostics: [mean_reward, max_score, total_training_time]
+  success_target:
+    mean_score: 1.0
+
+editable_surface:
+  mode: yaml_only
+  allowed_parameters: {}
+  forbidden:
+    - source_edits
+
+budget:
+  max_iterations: 3
+  max_wall_time_minutes: 30
+
+reporting:
+  final_report_author: codex

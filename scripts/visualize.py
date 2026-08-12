@@ -1,3 +1,5 @@
+# 这是实验可视化脚本。
+# 它读取 runs/<task>/<run_id> 下的状态、决策和指标文件，生成 reports/ 下的 HTML dashboard。
 import argparse
 import html
 import json
@@ -6,7 +8,7 @@ import time
 import webbrowser
 
 
-BASE_DIR = Path(__file__).resolve().parent
+BASE_DIR = Path(__file__).resolve().parent.parent
 RUNS_DIR = BASE_DIR / "runs"
 REPORTS_DIR = BASE_DIR / "reports"
 
@@ -27,10 +29,11 @@ def read_jsonl(path):
     return rows
 
 
-def latest_run_dir():
-    candidates = [p for p in RUNS_DIR.iterdir() if p.is_dir() and (p / "state.json").exists()]
+def latest_run_dir(task_name):
+    task_runs = RUNS_DIR / task_name
+    candidates = [p for p in task_runs.iterdir() if p.is_dir() and (p / "state.json").exists()] if task_runs.exists() else []
     if not candidates:
-        raise FileNotFoundError("No completed Agent run found under runs/.")
+        raise FileNotFoundError(f"No completed Agent run found under runs/{task_name}/.")
     return max(candidates, key=lambda p: p.stat().st_mtime)
 
 
@@ -353,12 +356,13 @@ def make_html(run_id, state, decisions, tool_calls, rows):
 
 def main():
     parser = argparse.ArgumentParser(description="Render a local HTML dashboard for an AutoResearch run.")
-    parser.add_argument("--run-id", default=None, help="Run id under runs/. Defaults to the latest Agent run.")
-    parser.add_argument("--output", default=None, help="Output HTML path. Defaults to reports/<run-id>/dashboard.html.")
+    parser.add_argument("--task", default="flappy_qlearning")
+    parser.add_argument("--run-id", default=None, help="Run id under runs/<task>/. Defaults to the latest task run.")
+    parser.add_argument("--output", default=None, help="Output HTML path. Defaults to reports/<task>/<run-id>/dashboard.html.")
     parser.add_argument("--open", action="store_true", help="Open the generated dashboard in the default browser.")
     args = parser.parse_args()
 
-    run_dir = RUNS_DIR / args.run_id if args.run_id else latest_run_dir()
+    run_dir = RUNS_DIR / args.task / args.run_id if args.run_id else latest_run_dir(args.task)
     if not run_dir.exists():
         raise FileNotFoundError(run_dir)
     run_id = run_dir.name
@@ -367,7 +371,7 @@ def main():
     tool_calls = read_jsonl(run_dir / "tool_calls.jsonl")
     rows = collect_experiments(run_dir, decisions)
 
-    output = Path(args.output) if args.output else REPORTS_DIR / run_id / "dashboard.html"
+    output = Path(args.output) if args.output else REPORTS_DIR / args.task / run_id / "dashboard.html"
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(make_html(run_id, state, decisions, tool_calls, rows), encoding="utf-8")
 

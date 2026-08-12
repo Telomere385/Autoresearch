@@ -1,3 +1,5 @@
+# 这里实现基于 LLM 的实验规划器。
+# 它把 Agent 传入的 context 压缩成 JSON prompt，要求模型只返回候选参数变更，并负责解析和校验返回结构。
 import json
 
 from .base import BasePlanner, PlannerError

@@ -1,3 +1,5 @@
+# 这是 AutoResearch Agent 的主入口。
+# 它负责读取任务配置和目标，构造 LLM planner 上下文，执行 baseline 与候选实验，并把决策、状态和报告写入 runs/。
 import argparse
 import copy
 import json
@@ -10,33 +12,47 @@ import traceback
 import yaml
 
 from planner import build_planner
+from scripts.vcs import commit_paths
 
 
 BASE_DIR = Path(__file__).resolve().parent
 RUNS_DIR = BASE_DIR / "runs"
+TASKS_DIR = BASE_DIR / "tasks"
 
 
 class ProgressBar:
     def __init__(self, total_steps):
         self.total_steps = max(1, int(total_steps))
         self.current = 0
+        self.last_line_length = 0
+        self.active_line = False
 
     def update(self, step, message):
         self.current = min(self.total_steps, max(self.current, int(step)))
         width = 28
         filled = int(width * self.current / self.total_steps)
         bar = "#" * filled + "-" * (width - filled)
-        print(f"\r[{bar}] {self.current}/{self.total_steps} {message}", end="", flush=True)
+        line = f"[{bar}] {self.current}/{self.total_steps} {message}"
+        padding = " " * max(0, self.last_line_length - len(line))
+        print(f"\r{line}{padding}", end="", flush=True)
+        self.last_line_length = len(line)
+        self.active_line = True
 
     def advance(self, message):
         self.update(self.current + 1, message)
 
     def line(self, message):
-        print(f"\n{message}", flush=True)
+        if self.active_line:
+            print("", flush=True)
+            self.active_line = False
+            self.last_line_length = 0
+        print(message, flush=True)
 
     def finish(self, message):
         self.update(self.total_steps, message)
         print("", flush=True)
+        self.active_line = False
+        self.last_line_length = 0
 
 
 def load_yaml(path):
@@ -72,12 +88,35 @@ def read_text(path):
         return f.read()
 
 
-def build_run_dir(run_id):
+def build_run_dir(task_name, run_id):
     if run_id is None:
         run_id = f"autoresearch_{time.strftime('%Y%m%d_%H%M%S')}"
-    run_dir = RUNS_DIR / run_id
+    run_dir = RUNS_DIR / task_name / run_id
     run_dir.mkdir(parents=True, exist_ok=False)
     return run_id, run_dir
+
+
+def resolve_task(task_name):
+    task_dir = TASKS_DIR / task_name
+    if not task_dir.exists():
+        raise FileNotFoundError(f"Unknown task: {task_name} ({task_dir})")
+    return task_dir
+
+
+def default_agent_config_path(task_dir):
+    flat_config = task_dir / "agent.yaml"
+    grouped_config = task_dir / "configs" / "agent.yaml"
+    if flat_config.exists():
+        return flat_config
+    return grouped_config
+
+
+def default_task_manifest_path(task_dir):
+    flat_manifest = task_dir / "task.yaml"
+    grouped_manifest = task_dir / "manifest" / "task.yaml"
+    if flat_manifest.exists():
+        return flat_manifest
+    return grouped_manifest
 
 
 def baseline_config_from_agent_config(config):
@@ -132,10 +171,14 @@ def validate_candidate(candidate, search_space, constraints, base_config):
     return {"valid": not errors, "errors": errors}
 
 
-def run_baseline(config_path, run_id, tool_log_path, progress=None):
+def run_task_experiment(task, config_path, run_id, tool_log_path, progress=None):
+    interface = task.get("interface", {})
+    runner = BASE_DIR / interface.get("experiment_runner", "")
+    if not runner.exists():
+        raise FileNotFoundError(f"Task runner not found: {runner}")
     cmd = [
         sys.executable,
-        str(BASE_DIR / "baseline.py"),
+        str(runner),
         "--config",
         str(config_path),
         "--run-id",
@@ -267,7 +310,7 @@ def make_context(config, program, task, goal, iteration, current_config, best, l
 def run_failure_demo(run_dir, config, base_config):
     candidate = {
         "candidate_id": "failure_demo",
-        "planner": "rules",
+        "planner": "validation_demo",
         "rationale": "Demonstrate constraint validation and recovery.",
         "changes": {"state_discretization.dx_dy_bin_size": 10},
     }
@@ -338,21 +381,64 @@ def write_state(run_dir, state):
     write_json(run_dir / "state.json", state)
 
 
+def export_best_config(task_dir, best):
+    if not best or not best.get("config"):
+        return None
+    if (task_dir / "configs").exists():
+        path = task_dir / "configs" / "best.yaml"
+    else:
+        path = task_dir / "best_config.yaml"
+    write_yaml(path, best["config"])
+    return path
+
+
+def maybe_commit_best_config(config, task_name, task_dir, best):
+    vcs_config = config.get("version_control", {})
+    if not vcs_config.get("enabled", False):
+        return {"status": "skipped", "reason": "version_control.enabled is false"}
+    best_path = export_best_config(task_dir, best)
+    if not best_path:
+        return {"status": "skipped", "reason": "no successful best config"}
+    if not vcs_config.get("auto_commit", False) and not vcs_config.get("push", False):
+        return {"status": "exported", "path": str(best_path), "reason": "auto_commit is false"}
+    message = vcs_config.get("commit_message") or f"Update best AutoResearch config for {task_name}"
+    try:
+        result = commit_paths(
+            [best_path],
+            message,
+            push=bool(vcs_config.get("push", False)),
+            remote=vcs_config.get("remote", "origin"),
+            branch=vcs_config.get("branch"),
+        )
+        result["path"] = str(best_path)
+        return result
+    except Exception as exc:
+        return {"status": "error", "type": type(exc).__name__, "message": str(exc), "path": str(best_path)}
+
+
 def main():
     parser = argparse.ArgumentParser(description="Run an offline-first, LLM-pluggable Mini AutoResearch loop.")
-    parser.add_argument("--config", default=str(BASE_DIR / "configs" / "agent.yaml"))
+    parser.add_argument("--task", default="flappy_qlearning")
+    parser.add_argument("--config", default=None)
     parser.add_argument("--run-id", default=None)
     args = parser.parse_args()
 
     started = time.time()
-    run_id, run_dir = build_run_dir(args.run_id)
-    config = load_yaml(Path(args.config))
+    task_dir = resolve_task(args.task)
+    config_path = Path(args.config) if args.config else default_agent_config_path(task_dir)
+    config = load_yaml(config_path)
+    task = optional_yaml(BASE_DIR / config.get("task_file", str(default_task_manifest_path(task_dir))))
+    task_name = args.task
+    run_id, run_dir = build_run_dir(task_name, args.run_id)
     max_iterations = int(config["budget"]["max_iterations"])
     progress = ProgressBar(total_steps=2 + max_iterations * 4)
     progress.update(0, "initializing")
-    program = optional_text(BASE_DIR / config.get("program_file", "PROGRAM.md"))
-    task = optional_yaml(BASE_DIR / config.get("task_file", "configs/task.yaml"))
-    goal = read_text(BASE_DIR / config.get("goal_file", "goals/default_goal.md"))
+    progress.line(
+        f"Progress total: baseline=2, each iteration=4, "
+        f"iterations={max_iterations}, total={progress.total_steps}"
+    )
+    program = optional_text(BASE_DIR / config.get("program_file", "docs/PROGRAM.md"))
+    goal = read_text(BASE_DIR / config.get("goal_file", str(task_dir / "goal.md")))
     write_yaml(run_dir / "config.yaml", config)
     write_yaml(run_dir / "task.yaml", task)
     with open(run_dir / "program.md", "w", encoding="utf-8") as f:
@@ -379,7 +465,8 @@ def main():
         baseline_config_path = run_dir / "baseline_candidate.yaml"
         write_yaml(baseline_config_path, base_config)
         progress.advance("running baseline train/eval")
-        _, baseline_summary_path = run_baseline(baseline_config_path, f"{run_id}/baseline", run_dir / "tool_calls.jsonl", progress)
+        baseline_task_run_id = f"{task_name}/{run_id}/baseline"
+        _, baseline_summary_path = run_task_experiment(task, baseline_config_path, baseline_task_run_id, run_dir / "tool_calls.jsonl", progress)
         baseline_summary = load_summary(baseline_summary_path)
         baseline = {"label": "baseline", "config": base_config, "summary": baseline_summary}
         best = baseline if baseline_summary.get("status") == "success" else None
@@ -435,7 +522,8 @@ def main():
             candidate_path = iter_dir / "candidate.yaml"
             write_yaml(candidate_path, candidate_config)
             progress.advance(f"iteration {iteration}/{max_iterations}: running train/eval")
-            returncode, summary_path = run_baseline(candidate_path, f"{run_id}/iteration_{iteration:03d}/baseline", run_dir / "tool_calls.jsonl", progress)
+            candidate_task_run_id = f"{task_name}/{run_id}/iteration_{iteration:03d}/baseline"
+            returncode, summary_path = run_task_experiment(task, candidate_path, candidate_task_run_id, run_dir / "tool_calls.jsonl", progress)
             summary = load_summary(summary_path)
             reflection = reflect_on_result(summary, best, config["objective"])
             write_json(iter_dir / "reflection.json", reflection)
@@ -457,7 +545,7 @@ def main():
             if decision == "accept":
                 best = last
                 current_config = candidate_config
-            progress.advance(f"iteration {iteration}/{max_iterations}: {decision} mean_score={summary.get('mean_score')}")
+            progress.advance(f"iteration {iteration}/{max_iterations}: complete {decision} mean_score={summary.get('mean_score')}")
             state.update({
                 "iteration": iteration,
                 "best": {"label": best["label"], "summary": best["summary"]} if best else None,
@@ -468,6 +556,7 @@ def main():
         state["status"] = "success"
         state["duration_seconds"] = time.time() - started
         state["best"] = {"label": best["label"], "summary": best["summary"]} if best else None
+        state["version_control"] = maybe_commit_best_config(config, task_name, task_dir, best)
         write_state(run_dir, state)
         generate_report(run_dir, goal, config, baseline, history, best)
         progress.finish("complete")

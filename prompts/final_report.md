@@ -4,8 +4,8 @@ Use this prompt with Codex after an Agent run finishes.
 
 Read:
 
-- `PROGRAM.md`
-- `configs/task.yaml`
+- `docs/PROGRAM.md`
+- `tasks/<task_name>/task.yaml`
 - `runs/<run_id>/goal.md`
 - `runs/<run_id>/state.json`
 - `runs/<run_id>/decisions.jsonl`

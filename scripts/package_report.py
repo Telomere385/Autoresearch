@@ -1,12 +1,17 @@
+# 这是报告打包脚本。
+# 它复用可视化模块读取实验产物，生成 dashboard、技术报告、运行记录和 artifacts 目录，便于交付或归档。
 import argparse
 import json
 from pathlib import Path
 import shutil
+import sys
 
-from visualize import collect_experiments, make_html, read_jsonl
+ROOT_DIR = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT_DIR))
 
+from scripts.visualize import collect_experiments, make_html, read_jsonl
 
-BASE_DIR = Path(__file__).resolve().parent
+BASE_DIR = ROOT_DIR
 RUNS_DIR = BASE_DIR / "runs"
 REPORTS_DIR = BASE_DIR / "reports"
 
@@ -62,34 +67,34 @@ def summarize_tool_calls(run_dir):
     return rows
 
 
-def make_readme(run_id, config_used):
+def make_readme(task_name, run_id, config_used):
     return f"""# Mini AutoResearch Run Package
 
-This folder packages one complete, real Mini AutoResearch run for the Flappy Bird Q-learning project.
+This folder packages one complete, real Mini AutoResearch run for a task plugin.
 
 ## Environment
 
 - Python 3.10 tested in the current workspace
-- Required packages are listed in `requirements.txt`
-- Pygame runs headless through SDL dummy video/audio drivers
+- Agent packages are listed in `requirements.txt`
+- Task packages are listed in `tasks/{task_name}/requirements.txt` when present
 
 ## Install
 
 ```powershell
-cd CODE_STUDENT
 pip install -r requirements.txt
+pip install -r tasks/{task_name}/requirements.txt
 ```
 
 ## Start Command
 
 ```powershell
-python agent.py --config {config_used} --run-id {run_id}
+python agent.py --task {task_name} --config {config_used} --run-id {run_id}
 ```
 
 ## Directory Structure
 
 ```text
-    reports/{run_id}/
+    reports/{task_name}/{run_id}/
       README.md
       technical_report.md
       run_record.md
@@ -106,7 +111,7 @@ python agent.py --config {config_used} --run-id {run_id}
 The original experiment artifacts remain under:
 
 ```text
-runs/{run_id}/
+runs/{task_name}/{run_id}/
 ```
 
 ## Input Format
@@ -131,7 +136,7 @@ The Agent writes:
 - `tool_calls.jsonl`: executed Python commands and return codes
 - `errors.jsonl`: validation failures and runtime errors
 - `report.md`: generated experiment report
-- per-iteration `summary.json` files under `runs/{run_id}/`
+- per-iteration `summary.json` files under `runs/{task_name}/{run_id}/`
 
 ## Known Limitations
 
@@ -153,14 +158,14 @@ def make_technical_report(run_id, state, decisions, tool_calls):
         "# Technical Report: Mini AutoResearch Agent",
         "",
         "## 1. Overview",
-        "This system implements an offline-first Mini AutoResearch Agent around the existing Flappy Bird Q-learning experiment. It reads a natural-language goal, proposes bounded configuration changes, executes real training and evaluation runs, validates metrics, records decisions, and generates a final report.",
+        "This system implements a Mini AutoResearch Agent around a task plugin. It reads a natural-language goal, proposes bounded configuration changes, executes real training and evaluation runs, validates metrics, records decisions, and packages artifacts for a Codex-written final report.",
         "",
         "## 2. Architecture",
         "- `agent.py` is the Agent controller and state machine.",
         "- `planner/` contains the structured LLM planner and provider adapters.",
-        "- `baseline.py` executes one train/eval experiment pair for a single seed.",
-        "- `experiment.py` executes one configured train or eval run.",
-        "- `src/flappyq.py` contains the original Q-learning environment and update loop.",
+        "- The selected task runner executes one train/eval experiment pair.",
+        "- `tasks/<task>/task.yaml` defines the task interface and output contract.",
+        "- `planner/` contains the structured LLM planner and provider adapters.",
         "",
         "## 3. Core Flow",
         "The Agent first runs a baseline, then performs three candidate iterations. Each iteration reads current state, asks the planner for a candidate, validates the proposal against the search space and constraints, writes a YAML config, runs a real train/eval experiment pair, checks JSON results, and decides accept, reject, rollback, or stop.",
@@ -224,7 +229,7 @@ def make_technical_report(run_id, state, decisions, tool_calls):
     return "\n".join(lines)
 
 
-def make_run_record(run_id, state, decisions, tool_calls):
+def make_run_record(task_name, run_id, state, decisions, tool_calls):
     lines = [
         "# Complete Run Record",
         "",
@@ -257,7 +262,7 @@ def make_run_record(run_id, state, decisions, tool_calls):
         f"- Planner calls: `artifacts/planner_calls.jsonl`",
         f"- Tool calls: `artifacts/tool_calls.jsonl`",
         f"- Errors: `artifacts/errors.jsonl`",
-        f"- Original run directory: `../../runs/{run_id}/`",
+        f"- Original run directory: `../../../runs/{task_name}/{run_id}/`",
         "",
     ]
     return "\n".join(lines)
@@ -265,16 +270,17 @@ def make_run_record(run_id, state, decisions, tool_calls):
 
 def main():
     parser = argparse.ArgumentParser(description="Package an AutoResearch run into a report folder.")
+    parser.add_argument("--task", default="flappy_qlearning")
     parser.add_argument("--run-id", required=True)
     parser.add_argument("--output", default=None)
-    parser.add_argument("--config-used", default="configs/agent.yaml")
+    parser.add_argument("--config-used", default=None)
     args = parser.parse_args()
 
     run_id = args.run_id
-    run_dir = RUNS_DIR / run_id
+    run_dir = RUNS_DIR / args.task / run_id
     if not run_dir.exists():
         raise FileNotFoundError(run_dir)
-    out_dir = Path(args.output) if args.output else REPORTS_DIR / run_id
+    out_dir = Path(args.output) if args.output else REPORTS_DIR / args.task / run_id
     artifacts = out_dir / "artifacts"
     artifacts.mkdir(parents=True, exist_ok=True)
 
@@ -294,9 +300,10 @@ def main():
     for src in sorted(run_dir.glob("iteration_*/reflection.json")):
         shutil.copy2(src, reflection_dir / f"{src.parent.name}_reflection.json")
 
-    write_text(out_dir / "README.md", make_readme(run_id, args.config_used))
+    config_used = args.config_used or f"tasks/{args.task}/agent.yaml"
+    write_text(out_dir / "README.md", make_readme(args.task, run_id, config_used))
     write_text(out_dir / "technical_report.md", make_technical_report(run_id, state, decisions, tool_calls))
-    write_text(out_dir / "run_record.md", make_run_record(run_id, state, decisions, tool_calls))
+    write_text(out_dir / "run_record.md", make_run_record(args.task, run_id, state, decisions, tool_calls))
     rows = collect_experiments(run_dir, decisions)
     write_text(out_dir / "dashboard.html", make_html(run_id, state, decisions, read_jsonl(run_dir / "tool_calls.jsonl"), rows))
     print(json.dumps({"report_dir": str(out_dir), "run_id": run_id}, indent=2))

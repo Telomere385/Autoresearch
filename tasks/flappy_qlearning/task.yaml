@@ -7,14 +7,14 @@ task:
     The task exposes a YAML-configured train/eval interface and writes JSON metrics.
 
 interface:
-  experiment_runner: baseline.py
-  single_run_runner: experiment.py
-  environment_source: src/flappyq.py
-  default_experiment_config: configs/experiment.yaml
+  experiment_runner: tasks/flappy_qlearning/run.py
+  single_run_runner: tasks/flappy_qlearning/run.py
+  environment_source: tasks/flappy_qlearning/src/flappyq.py
+  default_experiment_config: tasks/flappy_qlearning/config.yaml
   initial_data:
-    q_table: data/q_tables/Qvals.npy
+    q_table: tasks/flappy_qlearning/data/q_tables/Qvals.npy
   command_template: >
-    python baseline.py --config {config_path} --run-id {run_id}
+    python tasks/flappy_qlearning/run.py --config {config_path} --run-id {run_id}
   output:
     summary_json: runs/{run_id}/summary.json
     train_result_json: runs/{run_id}/train/result.json

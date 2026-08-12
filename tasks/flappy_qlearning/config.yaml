@@ -5,7 +5,7 @@ training_episodes: 1000
 evaluation_episodes: 100
 save_every: 100
 
-input_q_table: data/q_tables/Qvals.npy
+input_q_table: tasks/flappy_qlearning/data/q_tables/Qvals.npy
 q_init: heuristic
 
 fps_train: 1500

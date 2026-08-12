@@ -1,0 +1,3 @@
+seed: 0
+training_episodes: 10
+evaluation_episodes: 5

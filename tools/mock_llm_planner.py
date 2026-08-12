@@ -1,3 +1,5 @@
+# 这是本地 mock planner。
+# 它从 stdin 接收与真实 LLM 相同的 prompt，并返回固定格式的候选配置，用于无网络验证 Agent planning 接口。
 import json
 import sys
 
