@@ -227,7 +227,7 @@ def build_phase_configs(base_config, run_dir):
     return train_config_path, eval_config_path
 
 
-def call_self(config_path, mode, run_id, log_file):
+def call_self(config_path, mode, run_id, log_file, timeout_seconds):
     cmd = [
         sys.executable,
         str(TASK_DIR / "run.py"),
@@ -239,18 +239,28 @@ def call_self(config_path, mode, run_id, log_file):
         run_id,
     ]
     started = time.time()
-    completed = subprocess.run(
-        cmd,
-        cwd=str(ROOT_DIR),
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-    )
+    try:
+        completed = subprocess.run(
+            cmd,
+            cwd=str(ROOT_DIR),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=max(0.1, timeout_seconds),
+        )
+        returncode = completed.returncode
+        output = completed.stdout
+    except subprocess.TimeoutExpired as exc:
+        returncode = 124
+        output = exc.stdout or ""
+        if isinstance(output, bytes):
+            output = output.decode("utf-8", errors="replace")
+        output += f"\n{mode} timed out after {timeout_seconds:.1f} seconds.\n"
     elapsed = time.time() - started
     log_file.write("\n$ " + " ".join(cmd) + "\n")
-    log_file.write(completed.stdout)
+    log_file.write(output)
     log_file.flush()
-    return completed.returncode, elapsed
+    return returncode, elapsed
 
 
 def read_result(path):
@@ -288,8 +298,6 @@ def summarize(run_id, started_at, config, train_code, train_wall_time, train_res
         "eval_returncode": eval_code,
         "train_wall_time": train_wall_time,
         "eval_wall_time": eval_wall_time,
-        "train_result": train_result,
-        "eval_result": eval_result,
     }
 
 
@@ -313,7 +321,7 @@ def error_summary(run_id, started_at, exc):
     }
 
 
-def run_train_eval(config_path, run_id):
+def run_train_eval(config_path, run_id, timeout_seconds):
     started_at = time.time()
     run_dir = RUNS_DIR / run_id
     run_dir.mkdir(parents=True, exist_ok=False)
@@ -323,13 +331,18 @@ def run_train_eval(config_path, run_id):
         config["seed"] = int(config.get("seed", 0))
         write_yaml(run_dir / "config.yaml", config)
         train_config_path, eval_config_path = build_phase_configs(config, run_dir)
+        deadline = time.time() + timeout_seconds
         with open(run_dir / "experiment.log", "w", encoding="utf-8") as log_file:
-            train_code, train_wall_time = call_self(train_config_path, "train", f"{run_id}/train", log_file)
+            train_code, train_wall_time = call_self(
+                train_config_path, "train", f"{run_id}/train", log_file, deadline - time.time()
+            )
             train_result = read_result(single_result_path(f"{run_id}/train"))
             eval_code = None
             eval_wall_time = 0.0
             if train_code == 0 and is_success(train_result):
-                eval_code, eval_wall_time = call_self(eval_config_path, "eval", f"{run_id}/eval", log_file)
+                eval_code, eval_wall_time = call_self(
+                    eval_config_path, "eval", f"{run_id}/eval", log_file, deadline - time.time()
+                )
                 eval_result = read_result(single_result_path(f"{run_id}/eval"))
             else:
                 eval_result = {
@@ -352,21 +365,25 @@ def run_train_eval(config_path, run_id):
         "min_score": summary["min_score"],
         "max_score": summary["max_score"],
     }, indent=2))
+    return summary
 
 
 def main():
     parser = argparse.ArgumentParser(description="Run the Flappy Bird Q-learning task adapter.")
-    parser.add_argument("--config", default=str(TASK_DIR / "config.yaml"))
+    parser.add_argument("--config", required=True)
     parser.add_argument("--run-id", default=None)
     parser.add_argument("--mode", choices=["train", "eval"], default=None)
     parser.add_argument("--set", action="append", default=[], dest="overrides")
+    parser.add_argument("--timeout-seconds", type=float, default=600.0)
     args = parser.parse_args()
 
     run_id = args.run_id or f"flappy_qlearning_{time.strftime('%Y%m%d_%H%M%S')}"
     if args.mode:
-        run_single(args.mode, Path(args.config), run_id, args.overrides)
+        result = run_single(args.mode, Path(args.config), run_id, args.overrides)
     else:
-        run_train_eval(Path(args.config), run_id)
+        result = run_train_eval(Path(args.config), run_id, args.timeout_seconds)
+    if not is_success(result):
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

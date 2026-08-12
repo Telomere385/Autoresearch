@@ -1,36 +1,43 @@
-# 这是本地 mock planner。
-# 它从 stdin 接收与真实 LLM 相同的 prompt，并返回固定格式的候选配置，用于无网络验证 Agent planning 接口。
+"""State-dependent offline stand-in for smoke-testing the planner protocol."""
+
 import json
 import sys
 
 
 def main():
-    context = json.loads(sys.stdin.read())
-    iteration = int(context.get("iteration", 1))
-    candidates = [
-        {
-            "candidate_id": "iteration_001",
-            "rationale": "Smoke test candidate from local LLM-compatible command.",
-            "changes": {"epsilon_start": 0.05, "epsilon_end": 0.001, "epsilon_decay": 0.995},
-            "expected_effect": "Exercises the LLM planner path without a remote API call.",
-            "risk": "Smoke budgets are too short for meaningful score improvements.",
-        },
-        {
-            "candidate_id": "iteration_002",
-            "rationale": "Try a longer-term value estimate.",
-            "changes": {"discount_factor": 0.99, "epsilon_start": 0.01, "epsilon_end": 0.0},
-            "expected_effect": "May improve survival after more training.",
-            "risk": "May not help under tiny smoke budgets.",
-        },
-        {
-            "candidate_id": "iteration_003",
-            "rationale": "Try a denser control interval.",
-            "changes": {"sample_t": 2, "rewards.alive": 0.1},
-            "expected_effect": "May increase reward signal density.",
-            "risk": "Changes policy timing and can reduce stability.",
-        },
-    ]
-    print(json.dumps(candidates[min(iteration, len(candidates)) - 1]))
+    request = json.loads(sys.stdin.read())
+    history = request.get("previous_experiments", [])
+    current = request.get("current_config", {})
+
+    if not history:
+        proposal = {
+            "hypothesis": "More exploration may expose useful actions during the short training run.",
+            "changes": {"epsilon_start": 0.05},
+            "reason": "No candidate has been tested yet, so start with one bounded exploration change.",
+            "expected_effect": "The learned table may follow a different evaluation trajectory.",
+        }
+    elif history[-1]["decision"] == "accept":
+        proposal = {
+            "hypothesis": "A lower discount may prefer immediate survival signals after the accepted result.",
+            "changes": {"discount_factor": 0.9},
+            "reason": "The previous real result was accepted; test whether shorter-horizon updates improve it further.",
+            "expected_effect": "Immediate rewards should influence Q updates more strongly.",
+        }
+    elif current.get("rewards", {}).get("alive") != 0.1:
+        proposal = {
+            "hypothesis": "A denser survival reward may help after the previous candidate was rejected.",
+            "changes": {"rewards.alive": 0.1},
+            "reason": "The previous real result did not improve, so switch from value horizon to reward shaping.",
+            "expected_effect": "Mean reward may improve even when the short-run score remains tied.",
+        }
+    else:
+        proposal = {
+            "hypothesis": "A shorter action sampling interval may refine control after reward shaping.",
+            "changes": {"sample_t": 2},
+            "reason": "Reward shaping is already active, so test a distinct control-frequency hypothesis.",
+            "expected_effect": "More frequent decisions may change survival and score.",
+        }
+    print(json.dumps(proposal))
 
 
 if __name__ == "__main__":

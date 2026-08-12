@@ -1,144 +1,129 @@
-# Mini AutoResearch RL Agent
+# Mini AutoResearch
 
-This repository is a small AutoResearch-style framework for interface-clear reinforcement-learning tasks. The included task is `flappy_qlearning`, a Flappy Bird tabular Q-learning experiment.
+This repository contains a small research agent for iterating real Flappy Bird Q-learning experiments. The LLM chooses only the next bounded hyperparameter change. Python validates the proposal, edits the active YAML, runs the task, validates metrics, compares results, and accepts or rolls back the candidate.
 
-## Layout
+## Structure
 
 ```text
-agent.py                 Main AutoResearch loop.
-planner/                 LLM planner and provider adapters.
-scripts/                 Maintenance CLIs for onboarding, reports, and Git helpers.
-tasks/flappy_qlearning/  Runnable Flappy Q-learning task.
-tasks/template_rl_task/  Template for adding another task.
-docs/                    Operating protocol and project notes.
-runs/                    Generated experiment outputs.
-reports/                 Generated dashboards and packages.
+main.py                         Single command-line entry point
+autoresearch/agent.py           Complete observe-decide-act-evaluate-update loop
+autoresearch/planner.py         One-experiment LLM request and JSON parsing
+autoresearch/execution.py       Config edits, subprocess execution, validation, comparison
+autoresearch/report.py          Report generated only from persisted state
+configs/autoresearch.yaml       Runtime, model, budget, task, objective, and search configuration
+configs/smoke.yaml              Fast offline verification configuration
+tasks/flappy_qlearning/run.py   Train/evaluate task adapter
+tasks/flappy_qlearning/src/     Existing Flappy Bird Q-learning implementation
+tools/mock_llm_planner.py       State-dependent offline planner for smoke tests
+runs/                           Generated run artifacts
 ```
 
-Legacy files and old experiment outputs should not live in the active tree. Keep reproducible task code under `tasks/`, and keep generated artifacts under `runs/` or `reports/`.
+The control loop is intentionally in one file. `state.json` is the canonical state; `trajectory.jsonl` is the append-only event record.
 
 ## Install
 
 ```powershell
 pip install -r requirements.txt
-pip install -r tasks/flappy_qlearning/requirements.txt
 ```
 
-## Configure The Planner
+The task runs headlessly. Its code sets the SDL video and audio drivers to `dummy` unless they are already configured.
 
-For DashScope/Kimi, set the API key in the shell:
+## Configure
+
+Edit [configs/autoresearch.yaml](configs/autoresearch.yaml). It is the only runtime configuration and contains:
+
+- planner provider, model, base URL, API key environment variable, timeout, and retries
+- goal and experiment command paths
+- experiment, Agent-step, failure, wall-time, and subprocess limits
+- metric, optimization direction, optional target, and tie-breaker
+- baseline experiment and allowed parameter values
+
+Secrets are read from the configured environment variable and do not belong in YAML. The default DashScope-compatible setup uses:
 
 ```powershell
-$env:DASHSCOPE_API_KEY="your_api_key"
+$env:DASHSCOPE_API_KEY="your-api-key"
 ```
-
-The active task config is:
-
-```text
-tasks/flappy_qlearning/agent.yaml
-```
-
-Its planner block should look like:
-
-```yaml
-planner:
-  type: llm
-  provider: openai
-  model: kimi/kimi-k3
-  api_key_env: DASHSCOPE_API_KEY
-  base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
-  timeout_seconds: 60
-  max_retries: 3
-  retry_initial_seconds: 2.0
-  temperature: 0.2
-```
-
-`provider: openai` means OpenAI-compatible `/chat/completions`; it is used for DashScope compatible mode as well.
 
 ## Run
 
-Use a fresh `--run-id` each time:
+Run the real LLM-planned workflow:
 
 ```powershell
-python agent.py --task flappy_qlearning --run-id kimi_test_001
+python main.py --config configs/autoresearch.yaml --run-id research_001
 ```
 
-Run without network using the mock planner:
+Run the fast offline workflow. The local planner reads the accumulated real history before every proposal; it is not a precomputed sweep.
 
 ```powershell
-python agent.py --task flappy_qlearning --config tasks/flappy_qlearning/agent_smoke.yaml --run-id smoke_001
+python main.py --config configs/smoke.yaml --run-id smoke_001
 ```
 
-Generate dashboard and report package:
+Run regression tests:
 
 ```powershell
-python scripts/visualize.py --task flappy_qlearning --run-id kimi_test_001
-python scripts/package_report.py --task flappy_qlearning --run-id kimi_test_001
+python -m unittest discover -s tests -v
 ```
 
-## Add A Task
+Use a fresh run ID because the Agent refuses to overwrite an existing run.
 
-Place a project under:
+## Control Flow
+
+For every run, `autoresearch.agent.run_agent`:
+
+1. Loads the goal and the single runtime config.
+2. Writes and executes the baseline configuration.
+3. Builds planner context from canonical state, including all prior outcomes and failures.
+4. Requests and validates one proposal.
+5. Snapshots `current_config.yaml`, applies the candidate, and reads it back.
+6. Executes the configured command with a timeout and captures its exit code and output.
+7. Requires a successful JSON result with a finite configured metric.
+8. Compares candidate and best metrics deterministically.
+9. Keeps an accepted config or restores and verifies the pre-experiment config.
+10. Persists state and trajectory, checks explicit limits, and writes `report.md`.
+
+Planning and engineering failures consume bounded Agent steps but not real experiment iterations. A worse valid experiment is recorded as rejected and rolled back.
+
+## Artifacts
 
 ```text
-tasks/<task_name>/project/
+runs/<run_id>/
+  run_config.yaml
+  current_config.yaml
+  state.json
+  trajectory.jsonl
+  report.md
+  baseline/
+    config.yaml
+    execution.json
+    metrics.json
+    stdout.log
+    raw/
+  planning_attempts/step_01/
+    input.json
+    raw_output.txt
+    proposal.json
+    validation.json
+  iteration_01/
+    proposal.json
+    before_config.yaml
+    after_config.yaml
+    execution.json
+    metrics.json
+    stdout.log
+    raw/
 ```
 
-Generate the task adapter:
+The task's detailed train/eval results, Q-table, and logs remain under each `raw/` directory. Reports never fill in missing metrics.
 
-```powershell
-$env:DASHSCOPE_API_KEY="your_api_key"
-python scripts/onboard_task.py --task <task_name> --provider openai --model kimi/kimi-k3 --api-key-env DASHSCOPE_API_KEY --base-url https://dashscope.aliyuncs.com/compatible-mode/v1 --force
-```
+## Stop Reasons
 
-Then run:
+The persisted stop reason is one of:
 
-```powershell
-python agent.py --task <task_name>
-```
+- `iteration_budget_exhausted`
+- `agent_step_budget_exhausted`
+- `too_many_failures`
+- `wall_time_budget_exhausted`
+- `target_reached`
+- `unrecoverable_error`
 
-## Task Contract
-
-Each task must provide one of these layouts:
-
-```text
-tasks/<task_name>/task.yaml
-tasks/<task_name>/agent.yaml
-tasks/<task_name>/config.yaml
-tasks/<task_name>/goal.md
-tasks/<task_name>/run.py
-```
-
-or:
-
-```text
-tasks/<task_name>/manifest/task.yaml
-tasks/<task_name>/configs/agent.yaml
-tasks/<task_name>/configs/experiment.yaml
-tasks/<task_name>/configs/goal.md
-tasks/<task_name>/runner/run.py
-```
-
-The runner must accept:
-
-```powershell
-python <task_runner> --config <candidate_config> --run-id <task>/<run_id>/<phase>
-```
-
-and write:
-
-```text
-runs/<task>/<run_id>/<phase>/summary.json
-```
-
-Minimum summary fields:
-
-```json
-{
-  "status": "success",
-  "mean_score": 0.0,
-  "max_score": 0.0,
-  "mean_reward": 0.0,
-  "total_training_time": 0.0
-}
-```
+Every planner and experiment timeout is bounded. The task adapter returns a non-zero exit code when train/evaluation fails.

@@ -1,39 +1,47 @@
-program_file: docs/PROGRAM.md
-task_file: tasks/flappy_qlearning/task.yaml
 goal_file: tasks/flappy_qlearning/goal.md
 
 planner:
-  type: llm
-  provider: openai
+  provider: openai_compatible
   model: kimi/kimi-k3
   api_key_env: DASHSCOPE_API_KEY
   base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
   timeout_seconds: 60
-  max_retries: 3
-  retry_initial_seconds: 2.0
+  max_retries: 2
   temperature: 0.2
-  local_endpoint: null
-  local_command: null
 
 budget:
   max_iterations: 3
+  max_agent_steps: 6
+  max_consecutive_failures: 3
   max_wall_time_minutes: 30
+  experiment_timeout_seconds: 300
+
+experiment:
+  command:
+    - "{python}"
+    - tasks/flappy_qlearning/run.py
+    - --config
+    - "{config_path}"
+    - --run-id
+    - "{experiment_id}"
+    - --timeout-seconds
+    - "{timeout_seconds}"
+  metrics_path: runs/{experiment_id}/summary.json
+
+objective:
+  metric: mean_score
+  direction: maximize
+  target: 5.0
+  min_improvement: 0.0
+  tie_breaker_metric: mean_reward
+  tie_breaker_min_improvement: 0.0
+
+baseline:
   seed: 0
+  render: false
   training_episodes: 1000
   evaluation_episodes: 100
   save_every: 100
-
-objective:
-  primary_metric: mean_score
-  target_mean_score: 5.0
-  tie_breaker_metric: mean_reward
-  tie_breaker_min_improvement: 0.0
-  diagnostic_metrics: [mean_reward, total_training_time]
-  direction: maximize
-  min_improvement: 0.0
-
-base_experiment:
-  render: false
   input_q_table: tasks/flappy_qlearning/data/q_tables/Qvals.npy
   q_init: heuristic
   fps_train: 1500
@@ -65,19 +73,3 @@ search_space:
   discount_factor: [0.9, 0.95, 0.99]
   sample_t: [2, 3, 4]
   rewards.alive: [0.02, 0.05, 0.1]
-
-constraints:
-  forbid_source_edits: true
-  forbid_state_space_expansion: true
-  eval_epsilon_must_be_zero: true
-
-failure_demo:
-  enabled: false
-
-version_control:
-  enabled: false
-  auto_commit: false
-  push: false
-  remote: origin
-  branch: null
-  commit_message: null
