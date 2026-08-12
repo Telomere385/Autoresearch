@@ -4,6 +4,7 @@ pygame>=2.6,<3
 
 # Agent/runtime YAML configuration
 PyYAML>=6,<7
+openai>=2,<3
 
 # pygame 2.6.x imports pkg_resources at runtime
 setuptools<81

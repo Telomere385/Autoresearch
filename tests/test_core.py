@@ -5,16 +5,52 @@ import tempfile
 import textwrap
 import time
 import unittest
+from unittest.mock import patch
+
+from openai.types.chat import ChatCompletion
 
 from autoresearch.agent import _initial_state, _validate_runtime_config, run_agent
 from autoresearch.execution import compare_metrics, load_yaml, verify_execution, write_yaml
-from autoresearch.planner import PlannerError, _normalize_assistant_message, parse_tool_call
+from autoresearch.planner import PlannerError, _normalize_assistant_message, chat, parse_tool_call
 from autoresearch.progress import ProgressReporter, tool_summary
 from autoresearch.report import validate_report
 from autoresearch.tooling import ToolHarness
 
 
 class CoreTests(unittest.TestCase):
+    def test_openai_sdk_transport_preserves_kimi_fields_and_configuration(self):
+        payload = {
+            "choices": [{"message": {
+                "role": "assistant", "content": None,
+                "reasoning_content": "inspect before acting",
+                "tool_calls": [{
+                    "id": "call_sdk", "type": "function",
+                    "function": {"name": "read_file", "arguments": '{"path":"goal.md"}'},
+                }],
+            }}],
+            "usage": {"total_tokens": 12},
+        }
+        factory = FakeOpenAIClientFactory(payload)
+        config = {
+            "provider": "openai_compatible", "model": "kimi/kimi-k3",
+            "api_key_env": "TEST_OPENAI_KEY", "base_url": "https://example.test/v1/",
+            "timeout_seconds": 17, "max_retries": 4, "temperature": 0.1,
+        }
+        with patch.dict("os.environ", {"TEST_OPENAI_KEY": "secret"}):
+            message, raw = chat(
+                [{"role": "user", "content": "goal"}], [{"type": "function"}],
+                config, client_factory=factory,
+            )
+        self.assertEqual(message["reasoning_content"], "inspect before acting")
+        self.assertEqual(message["tool_calls"][0]["id"], "call_sdk")
+        self.assertEqual(raw["usage"]["total_tokens"], 12)
+        self.assertEqual(factory.client_kwargs["base_url"], "https://example.test/v1")
+        self.assertEqual(factory.client_kwargs["timeout"], 17.0)
+        self.assertEqual(factory.client_kwargs["max_retries"], 4)
+        self.assertNotIn("secret", json.dumps(factory.create_kwargs))
+        self.assertFalse(factory.create_kwargs["parallel_tool_calls"])
+        self.assertEqual(factory.create_kwargs["tool_choice"], "required")
+
     def test_progress_reporter_heartbeats_and_never_prints_file_content(self):
         stream = io.StringIO()
         reporter = ProgressReporter("normal", stream=stream, heartbeat_interval=0.01)
@@ -48,6 +84,24 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(arguments, {"path": "goal.md"})
         with self.assertRaises(PlannerError):
             parse_tool_call({"id": "bad", "function": {"name": "x", "arguments": "{"}})
+
+    def test_openai_sdk_model_retains_dashscope_reasoning_content(self):
+        sdk_response = ChatCompletion.model_validate({
+            "id": "test", "object": "chat.completion", "created": 0,
+            "model": "kimi/kimi-k3", "choices": [{
+                "index": 0, "finish_reason": "tool_calls", "message": {
+                    "role": "assistant", "content": None,
+                    "reasoning_content": "provider reasoning",
+                    "tool_calls": [{
+                        "id": "call_1", "type": "function",
+                        "function": {"name": "read_file", "arguments": "{}"},
+                    }],
+                },
+            }],
+        }).model_dump(mode="json")
+        message = sdk_response["choices"][0]["message"]
+        self.assertEqual(message["reasoning_content"], "provider reasoning")
+        self.assertEqual(message["tool_calls"][0]["function"]["name"], "read_file")
 
     def test_runtime_requires_three_iterations_and_native_llm(self):
         config = load_yaml(Path(__file__).resolve().parents[1] / "configs" / "autoresearch.yaml")
@@ -223,6 +277,40 @@ class ScriptedLLM:
             }],
         }
         return message, {"choices": [{"message": message}], "usage": {"total_tokens": 1}}
+
+
+class FakeCompletion:
+    def __init__(self, payload):
+        self.payload = payload
+
+    def model_dump(self, mode):
+        if mode != "json":
+            raise AssertionError("Expected JSON serialization")
+        return self.payload
+
+
+class FakeOpenAIClientFactory:
+    def __init__(self, payload):
+        self.payload = payload
+        self.client_kwargs = None
+        self.create_kwargs = None
+
+    def __call__(self, **kwargs):
+        self.client_kwargs = kwargs
+        factory = self
+
+        class Completions:
+            def create(self, **create_kwargs):
+                factory.create_kwargs = create_kwargs
+                return FakeCompletion(factory.payload)
+
+        class Chat:
+            completions = Completions()
+
+        class Client:
+            chat = Chat()
+
+        return Client()
 
 
 def _integration_config():

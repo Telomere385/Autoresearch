@@ -31,7 +31,7 @@ Set the configured API key environment variable:
 $env:DASHSCOPE_API_KEY="your-api-key"
 ```
 
-The default `kimi/kimi-k3` setup uses OpenAI-compatible native Function Calling. The client preserves Kimi's `reasoning_content` in subsequent messages and disables parallel tool calls.
+The default `kimi/kimi-k3` setup uses the official OpenAI Python SDK against DashScope's OpenAI-compatible Chat Completions endpoint. The transport configures connection reuse, timeout, typed API errors, and SDK retries. The Agent preserves Kimi's provider-specific `reasoning_content` in subsequent messages and disables parallel tool calls.
 
 ## Run
 
@@ -51,7 +51,7 @@ Progress is printed live to `stderr` while the final machine-readable result rem
 [13:43:48] EXP     baseline finished in 15.2s, returncode=0, mean_score=5.2
 ```
 
-An LLM request or experiment that takes longer than 15 seconds emits a heartbeat every 15 seconds. Use `--quiet` to disable progress or `--verbose` to include API retry and bounded output-tail diagnostics:
+An LLM request or experiment that takes longer than 15 seconds emits a heartbeat every 15 seconds. Use `--quiet` to disable progress or `--verbose` to include SDK error details and bounded output-tail diagnostics:
 
 ```powershell
 python main.py --config configs/autoresearch.yaml --run-id research_agent_001 --verbose

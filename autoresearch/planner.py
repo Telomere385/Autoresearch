@@ -1,16 +1,16 @@
 import json
 import os
-import time
-import urllib.error
-import urllib.request
+
+import openai
+from openai import OpenAI
 
 
 class PlannerError(RuntimeError):
     pass
 
 
-def chat(messages, tools, config, tool_choice="required", reporter=None):
-    """Call an OpenAI-compatible model and return one assistant message."""
+def chat(messages, tools, config, tool_choice="required", reporter=None, client_factory=OpenAI):
+    """Call an OpenAI-compatible model through the official Python SDK."""
     if config.get("provider", "openai_compatible") != "openai_compatible":
         raise PlannerError("Only the openai_compatible LLM provider is supported")
     api_key_env = config.get("api_key_env", "OPENAI_API_KEY")
@@ -18,48 +18,48 @@ def chat(messages, tools, config, tool_choice="required", reporter=None):
     if not api_key:
         raise PlannerError(f"Missing API key environment variable: {api_key_env}")
 
-    body = {
-        "model": config["model"],
-        "messages": messages,
-        "tools": tools,
-        "tool_choice": tool_choice,
-        "parallel_tool_calls": False,
-        "temperature": float(config.get("temperature", 0.2)),
-    }
-    retries = int(config.get("max_retries", 2))
     timeout = float(config.get("timeout_seconds", 60))
-    endpoint = config.get("base_url", "https://api.openai.com/v1").rstrip("/")
-    last_error = None
-    for attempt in range(retries + 1):
-        request = urllib.request.Request(
-            f"{endpoint}/chat/completions",
-            data=json.dumps(body).encode("utf-8"),
-            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-            method="POST",
+    retries = int(config.get("max_retries", 2))
+    base_url = config.get("base_url", "https://api.openai.com/v1").rstrip("/")
+    try:
+        client = client_factory(
+            api_key=api_key,
+            base_url=base_url,
+            timeout=timeout,
+            max_retries=retries,
         )
-        try:
-            with urllib.request.urlopen(request, timeout=timeout) as response:
-                payload = json.loads(response.read().decode("utf-8"))
-            message = payload["choices"][0]["message"]
-            return _normalize_assistant_message(message), payload
-        except (
-            KeyError,
-            IndexError,
-            json.JSONDecodeError,
-            urllib.error.URLError,
-            TimeoutError,
-        ) as exc:
-            last_error = exc
-            if attempt < retries:
-                delay = min(2 ** attempt, 8)
-                if reporter is not None:
-                    reporter.emit(
-                        "RETRY",
-                        f"LLM API attempt {attempt + 1} failed ({type(exc).__name__}); retrying in {delay}s",
-                        verbose=True,
-                    )
-                time.sleep(delay)
-    raise PlannerError(f"LLM API call failed after {retries + 1} attempts: {last_error}")
+        completion = client.chat.completions.create(
+            model=config["model"],
+            messages=messages,
+            tools=tools,
+            tool_choice=tool_choice,
+            parallel_tool_calls=False,
+            temperature=float(config.get("temperature", 0.2)),
+        )
+        payload = completion.model_dump(mode="json")
+        message = payload["choices"][0]["message"]
+        return _normalize_assistant_message(message), payload
+    except openai.APIError as exc:
+        detail = _sdk_error_detail(exc)
+        if reporter is not None:
+            reporter.emit("ERROR", f"LLM SDK request failed: {detail}", verbose=True)
+        raise PlannerError(f"LLM SDK request failed: {detail}") from exc
+    except (KeyError, IndexError, TypeError, ValueError) as exc:
+        raise PlannerError(f"LLM SDK returned an invalid response: {exc}") from exc
+
+
+def _sdk_error_detail(exc):
+    parts = [type(exc).__name__]
+    status_code = getattr(exc, "status_code", None)
+    request_id = getattr(exc, "request_id", None)
+    if status_code is not None:
+        parts.append(f"status={status_code}")
+    if request_id:
+        parts.append(f"request_id={request_id}")
+    message = str(exc).strip()
+    if message:
+        parts.append(message[:1000])
+    return "; ".join(parts)
 
 
 def _normalize_assistant_message(message):
@@ -69,7 +69,9 @@ def _normalize_assistant_message(message):
         "role": "assistant",
         "content": message.get("content") or "",
     }
-    # Kimi reasoning models require this field to be replayed verbatim.
+    # DashScope Kimi reasoning models require this provider-specific field to
+    # be replayed verbatim in later assistant messages. The SDK retains unknown
+    # response properties when model_dump() serializes the response model.
     if "reasoning_content" in message:
         normalized["reasoning_content"] = message.get("reasoning_content") or ""
     if message.get("tool_calls") is not None:
