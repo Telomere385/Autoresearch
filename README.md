@@ -1,47 +1,59 @@
 # Mini AutoResearch Agent Harness
 
-This repository implements a small LLM Agent that improves a real Flappy Bird Q-learning experiment. The LLM receives a natural-language goal, creates a multi-step plan, selects native function tools, edits run-local configuration, launches Python subprocesses, inspects metrics and logs, decides whether to accept or roll back each candidate, and writes the final report.
+Mini AutoResearch is a compact LLM-agent harness for running real, bounded machine-learning experiments. In the included task, the agent improves a Flappy Bird Q-learning policy by inspecting the project, planning a sequence of experiments, editing run-local configuration, launching training and evaluation processes, comparing measured results, and documenting its findings.
 
-Python is the harness, not the planner. It executes the requested tools, restricts filesystem and command access, independently validates metrics, verifies rollback snapshots, enforces budgets, and records the complete interaction.
+The LLM decides what to investigate and which experiment to try next. The Python harness controls what may actually happen: it validates every tool request, restricts file and command access, verifies metrics independently, enforces experiment budgets, performs checked rollbacks, and records the complete run for later audit.
 
-## Install
+## Key Properties
+
+- **Real experiments:** candidates are trained and evaluated by Python subprocesses; results are neither simulated nor precomputed.
+- **Bounded autonomy:** the search space, filesystem access, command execution, experiment count, tool-call count, and runtime are explicitly limited.
+- **Independent verification:** process status, metric files, candidate configurations, comparisons, rollbacks, and the final report are checked by deterministic code.
+- **Recoverable iteration:** each candidate starts from a snapshot of the last accepted configuration, allowing regressions to be rolled back and verified.
+- **Complete traceability:** model messages, tool calls, configurations, logs, metrics, state transitions, and reports are persisted under a unique run directory.
+
+For a detailed architecture and experiment analysis, see [Report.md](Report.md).
+
+## Quick Start
 
 Python 3.10 or newer is recommended.
+
+### 1. Install dependencies
 
 ```powershell
 python -m pip install -r requirements.txt
 ```
 
-The Flappy Bird task sets SDL video and audio drivers to `dummy` for headless execution.
+The Flappy Bird task automatically uses SDL's `dummy` video and audio drivers, so experiments can run without a display or audio device.
 
-## Configure
+### 2. Configure the provider
 
-The default configuration is [configs/autoresearch.yaml](configs/autoresearch.yaml). It contains:
+The default runtime configuration is [configs/autoresearch.yaml](configs/autoresearch.yaml). It defines:
 
-- OpenAI-compatible provider, model, API endpoint, timeout, and retry settings;
-- natural-language goal file, task command, data/Q-table path, and metric path;
-- minimum/maximum candidate experiments, tool-call, failure, wall-time, and subprocess budgets;
-- baseline configuration and allowed candidate parameter values;
+- the OpenAI-compatible provider, model, endpoint, timeout, and retry policy;
+- the natural-language goal, experiment command, input data, and metrics path;
+- the optimization objective, baseline, and allowed hyperparameter values;
+- candidate, tool-call, failure, wall-clock, and subprocess budgets;
 - readable paths, the run-local writable path, and the command allowlist;
-- the requirement for a real failure-and-recovery event.
+- the requirement to demonstrate a measured failure or regression followed by a verified rollback.
 
-Set the configured API key environment variable:
+Set the API key through the environment variable named in the configuration:
 
 ```powershell
 $env:DASHSCOPE_API_KEY="your-api-key"
 ```
 
-The default `kimi/kimi-k3` setup uses the official OpenAI Python SDK against DashScope's OpenAI-compatible Chat Completions endpoint. The transport configures connection reuse, timeout, typed API errors, and SDK retries. The Agent preserves Kimi's provider-specific `reasoning_content` in subsequent messages and disables parallel tool calls.
+The default configuration uses `kimi/kimi-k3` through DashScope's OpenAI-compatible Chat Completions endpoint and the official OpenAI Python SDK. SDK timeouts and retries are configurable. Provider-specific `reasoning_content` returned by Kimi is preserved in later messages, and parallel tool calls are disabled.
 
-## Run
-
-Start the complete workflow with one main command:
+### 3. Start a run
 
 ```powershell
 python main.py --config configs/autoresearch.yaml --run-id research_agent_001
 ```
 
-Progress is printed live to `stderr` while the final machine-readable result remains on `stdout`:
+Each run ID must be new. The harness creates `runs/<run_id>/` with `exist_ok=False` and never overwrites an existing run.
+
+Live progress is written to `stderr`, while the final machine-readable result is written to `stdout`:
 
 ```text
 [13:41:10] PLAN    submitted 6 steps
@@ -51,64 +63,71 @@ Progress is printed live to `stderr` while the final machine-readable result rem
 [13:43:48] EXP     baseline finished in 15.2s, returncode=0, mean_score=5.2
 ```
 
-An LLM request or experiment that takes longer than 15 seconds emits a heartbeat every 15 seconds. Use `--quiet` to disable progress or `--verbose` to include SDK error details and bounded output-tail diagnostics:
+Long-running model requests and experiments emit a heartbeat every 15 seconds. Use `--quiet` to suppress progress or `--verbose` to include bounded output-tail and SDK error diagnostics:
 
 ```powershell
-python main.py --config configs/autoresearch.yaml --run-id research_agent_001 --verbose
+python main.py --config configs/autoresearch.yaml --run-id research_agent_002 --verbose
 ```
 
-Progress never prints API keys, complete prompts, file contents, or full model reasoning.
+Progress output does not include API keys, complete prompts, file contents, or full model reasoning.
 
-Override the goal directly from the command line:
+To override the configured goal for one run:
 
 ```powershell
-python main.py --config configs/autoresearch.yaml --run-id research_agent_002 --goal "在五次实验内提高 mean_score，至少完成三轮候选实验，并记录失败恢复过程"
+python main.py --config configs/autoresearch.yaml --run-id research_agent_003 --goal "在五次实验内提高 mean_score，至少完成三轮候选实验，并记录失败恢复过程"
 ```
 
-Every run ID must be new; the Agent never overwrites an existing run.
+## How the Agent Works
 
-Run the regression and end-to-end harness tests with:
+The agent follows an explicit plan–act–observe–validate loop:
 
-```powershell
-python -m unittest discover -s tests -v
-```
+1. It reads the research goal and submits a multi-step plan.
+2. It inspects the runtime configuration, task code, data metadata, metrics, and logs as needed.
+3. It writes the exact baseline configuration to the current run directory and launches the baseline explicitly.
+4. It proposes candidates using only values declared in the configured search space.
+5. It runs each candidate, inspects the measured result, and requests either acceptance or rollback.
+6. The harness independently checks the decision and verifies any requested snapshot restoration.
+7. The agent updates its plan, writes the final report, and requests completion.
 
-The end-to-end test uses a scripted test double only to make protocol assertions deterministic. It still launches three real temporary Python subprocess experiments and derives their metrics from written configurations. The production entry point has no scripted proposals or prewritten experiment results.
+The model must issue exactly one native tool call per turn. The available tools are:
 
-## Agent and Tool Loop
+| Tool | Purpose |
+|---|---|
+| `submit_plan` | Create the required multi-step research plan before other work begins. |
+| `update_plan` | Record step status, supporting evidence, and the next action. |
+| `list_files` | List bounded file metadata under an approved read root. |
+| `read_file` | Read a bounded UTF-8 slice from an approved path. |
+| `write_file` | Write a size-limited UTF-8 artifact inside the current run directory. |
+| `run_command` | Launch the configured Python experiment with validated arguments and `shell=False`. |
+| `evaluate_result` | Submit an evidence-based accept/rollback decision for the pending candidate. |
+| `restore_snapshot` | Restore and read-back verify the pre-candidate configuration snapshot. |
+| `finish` | Complete the run after all plan, experiment, recovery, and report checks pass. |
 
-The model receives native tool schemas and must call exactly one tool per turn:
+The baseline is not hidden inside a preprogrammed optimization workflow: the agent must inspect the inputs, write `current_config.yaml`, and call `run_command` itself. Candidate proposals and outcomes are likewise not hard-coded.
 
-- `submit_plan` and `update_plan` create and maintain an explicit multi-step plan;
-- `list_files` and `read_file` inspect the goal, source, configuration, data metadata, logs, and metrics;
-- `write_file` writes only inside `runs/<run_id>/` and records before/after hashes;
-- `run_command` uses `subprocess.run(..., shell=False)` and only permits the configured Python experiment;
-- `evaluate_result` records the LLM's evidence-based accept/rollback decision and compares it with an independent metric check;
-- `restore_snapshot` performs and verifies a requested rollback;
-- `finish` validates minimum iterations, plan completion, recovery evidence, and the LLM-authored report.
+## Safety and Independent Verification
 
-The baseline is not launched by a hidden Python workflow. The LLM must inspect inputs, write `current_config.yaml`, and call `run_command` itself. Candidate results are not precomputed or hard-coded.
+The harness treats model output and subprocess output as evidence to verify, not as trusted truth.
 
-At least three candidate experiments are required; the baseline does not count. The default maximum is five so the Agent can obtain real failure/recovery evidence. A normal finish requires a measured candidate regression or failed experiment followed by a verified snapshot rollback. The prompt explicitly forbids intentionally corrupting a command or configuration to manufacture failure. Safety limits can still stop an unhealthy run early.
+Before and after an experiment, it checks:
 
-## Independent Verification
-
-The harness does not assume that a command or LLM conclusion is correct. It checks:
-
-- subprocess timeout and return code;
-- metrics file existence and valid JSON;
-- task `status` and a finite objective metric;
+- read and write paths against run-scoped allowlists;
+- the executable, script, configuration path, run ID, and timeout;
 - candidate changes against the configured search space;
-- duplicate configurations;
+- full-configuration fingerprints to reject duplicate candidates;
+- subprocess timeout and return code;
+- metrics-file existence, valid JSON, successful task status, and a finite objective metric;
 - candidate metrics against the canonical best result;
-- rollback contents by reading back the saved snapshot;
-- final report sections, all iteration references, and the exact best metric value.
+- rollback contents by reading back the restored snapshot;
+- final-report sections, iteration references, recovery evidence, and the exact best metric value.
 
-An invalid tool request is returned to the model as a real tool error so it can reflect and correct its next action. An improving candidate may be conservatively rolled back by the LLM, but a declining or invalid candidate cannot be accepted against the independent checker.
+A candidate that improves the objective may be conservatively rolled back by the LLM, but a declining or invalid candidate cannot be accepted against the independent checker. Invalid tool requests are returned as structured errors so the agent can correct them within its remaining failure and tool-call budgets.
 
-## Execution Records
+The default protocol requires at least three and at most five candidate experiments; the baseline does not count. Normal completion also requires a genuine measured regression or failed experiment followed by a verified rollback. The system prompt explicitly forbids corrupting a command or configuration to manufacture this evidence.
 
-Each run is fully auditable:
+## Run Artifacts
+
+Every run is stored under a unique directory:
 
 ```text
 runs/<run_id>/
@@ -137,15 +156,36 @@ runs/<run_id>/
   iteration_03/
 ```
 
-`messages.jsonl` contains the complete LLM/tool conversation. `trajectory.jsonl` contains decisions, arguments, outputs, errors, recovery actions, and next actions. API keys are read only from the environment and are never persisted.
+The main records serve different purposes:
 
-## Termination
+- `state.json` is the latest structured state-machine snapshot.
+- `messages.jsonl` contains the complete system, user, assistant, and tool conversation.
+- `trajectory.jsonl` records decisions, arguments, results, errors, recovery actions, and terminal events.
+- `llm_calls/` preserves the exact request and raw response for each model call.
+- `tool_calls/` preserves the arguments and structured result for each tool call.
+- baseline and iteration directories contain configurations, execution metadata, metrics, logs, and raw training/evaluation artifacts.
 
-Normal completion uses `agent_finish`. Safety exits include:
+API keys are read only from the environment and are not persisted by the harness. Because run artifacts contain complete prompts and tool observations, review them before publishing or sharing them externally.
+
+## Testing
+
+Run the unit and end-to-end harness tests with:
+
+```powershell
+python -m unittest discover -s tests -v
+```
+
+The end-to-end test replaces only the network model with a scripted test double so protocol assertions remain deterministic. It still uses the production control loop, launches real temporary Python subprocesses, derives metrics from written configurations, evaluates three candidates, and verifies rollback and completion behavior. The production entry point contains no scripted proposals or prewritten experiment results.
+
+## Completion and Safety Stops
+
+Normal completion uses the `agent_finish` stop reason after all plan, experiment, recovery, and report requirements pass.
+
+Safety stop reasons include:
 
 - `tool_call_budget_exhausted`;
 - `too_many_failures`;
 - `wall_time_budget_exhausted`;
 - `unrecoverable_error`.
 
-A safety exit before all requirements are met is reported as `failed` or `incomplete_requirements`, never as a successful research result.
+A safety stop before all completion requirements are satisfied is reported as `failed` or `incomplete_requirements`, never as a successful research result. Existing state, trajectory, and experiment artifacts remain available for diagnosis.
