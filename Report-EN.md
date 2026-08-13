@@ -259,6 +259,23 @@ The project bounds both individual observations and cumulative recent history. A
 
 The window is measured in serialized JSON characters, not exact model tokenizer units. The fixed system prompt, original goal, tool schemas, and state summary are also outside `max_recent_chars`. The system still has no pre-request token estimate, specialized context-limit recovery, or cross-process resume capability. Longer tasks should add model-aware token budgeting, a summary-size bound, long-term semantic memory for evicted rationale, and persistent recovery.
 
+#### Post-Implementation Comparison
+
+To evaluate the change, the full-history run `research_agent_003` and the authoritative-summary/sliding-window run `context_control_001` were aligned at the point where Iteration 1 had been accepted. Both runs had the same baseline `mean_score` of 5.20. Token figures come from the API usage fields in each `response.json` and include successful responses only.
+
+| Metric | Before optimization | After optimization | Change |
+|---|---:|---:|---:|
+| Successful LLM calls required to reach this point | 17 | 19 | +2 |
+| Cumulative prompt tokens | 248,855 | 121,842 | **-51.0%** |
+| Cumulative completion tokens | 5,918 | 9,515 | +60.8% |
+| Cumulative total tokens | 254,773 | 131,357 | **-48.4%** |
+| Iteration 1 `mean_score` | 10.47 | **18.96** | **+81.1%** |
+| Iteration 1 `mean_reward` | 218.29 | **459.66** | **+110.6%** |
+
+For the individual request that produced the Iteration 1 evaluation decision, prompt usage fell from 26,057 to 7,116 tokens, a reduction of **72.7%**. The optimized request contained only 11 messages and the four most recent complete turn groups, omitting 14 older groups. The earlier run consumed 1,012,192 total tokens across five candidates and reached a best `mean_score` of 14.31; the new run had already observed 18.96 after its first candidate and 131,357 cumulative tokens. In this run, the change therefore coincided with both lower context cost and higher early search efficiency.
+
+This comparison is not a controlled causal A/B experiment. The two Iteration 1 candidates used different configurations, and both evaluations used only `seed=0`. The new run also required tool corrections for a duplicate plan submission, invalid parameters, and an excessive command timeout. It later stopped after Iteration 1 when DashScope returned an insufficient-balance HTTP 429 error, so it did not complete all experiments, the required rollback evidence, or the final report. The evidence establishes that context compaction substantially reduced token growth; attributing the score improvement to context management requires repeated complete runs with identical candidates and multiple random seeds. The underlying records are available in [`research_agent_003/state.json`](runs/research_agent_003/state.json), [`context_control_001/state.json`](runs/context_control_001/state.json), and the respective `llm_calls/` directories.
+
 ### Plan–Act–Observe–Validate Loop
 
 The main loop consists of five consecutive stages. Although the LLM issues only one tool call per turn, multiple turns combine into a complete experiment. State, plan status, and tool preconditions ensure that ordering is not enforced by prompt compliance alone.
