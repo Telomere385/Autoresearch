@@ -9,6 +9,11 @@ planner:
   max_retries: 2
   temperature: 0.2
 
+context:
+  enabled: true
+  recent_turns: 4
+  max_recent_chars: 24000
+
 budget:
   min_iterations: 3
   max_iterations: 5

@@ -15,6 +15,11 @@ from .tooling import ToolHarness, tool_schemas
 
 ROOT = Path(__file__).resolve().parent.parent
 RUNS = ROOT / "runs"
+DEFAULT_CONTEXT_CONFIG = {
+    "enabled": True,
+    "recent_turns": 4,
+    "max_recent_chars": 24_000,
+}
 
 
 def run_agent(
@@ -80,19 +85,21 @@ def run_agent(
             state["agent_steps"] = state["llm_call_count"]
             llm_dir = run_dir / "llm_calls" / f"call_{state['llm_call_count']:03d}"
             llm_dir.mkdir(parents=True)
+            request_messages, context_record = _build_model_context(messages, state, config)
             # Persist the exact model context before the network call so a
             # stalled or failed request remains diagnosable after termination.
             request_body = {
-                "model": config["planner"]["model"], "messages": messages,
+                "model": config["planner"]["model"], "messages": request_messages,
                 "tools": schemas, "tool_choice": "required", "parallel_tool_calls": False,
             }
             write_json(llm_dir / "request.json", request_body)
+            write_json(llm_dir / "context.json", context_record)
             llm_started = time.monotonic()
             reporter.emit("LLM", f"call {state['llm_call_count']} started")
             try:
                 with reporter.waiting("LLM", f"call {state['llm_call_count']} waiting"):
                     assistant, raw_response = llm(
-                        messages, schemas, config["planner"], "required"
+                        request_messages, schemas, config["planner"], "required"
                     )
             except (PlannerError, OSError, ValueError) as exc:
                 _record_llm_failure(state, trajectory_path, exc)
@@ -180,6 +187,12 @@ def run_agent(
                     "next_action": result.get("next_action"),
                 })
 
+            state["last_tool"] = {
+                "name": tool_name,
+                "tool_call": state["tool_call_count"],
+                "ok": bool(result.get("ok")),
+                "result": _compact_tool_result(result),
+            }
             tool_message = {
                 "role": "tool", "tool_call_id": call_id, "name": tool_name,
                 "content": json.dumps(result, ensure_ascii=False),
@@ -247,7 +260,7 @@ def _initial_state(run_id, goal, config):
         "failures": [], "recovery_events": [], "requirements": {
             "min_iterations_met": False, "recovery_demonstrated": False, "report_verified": False,
         },
-        "stop_reason": None, "agent_summary": None,
+        "last_tool": None, "stop_reason": None, "agent_summary": None,
     }
 
 
@@ -269,6 +282,7 @@ Research constraints:
 - A measured candidate regression or failed experiment followed by verified snapshot rollback must be demonstrated before finish. Do not intentionally corrupt a command or configuration to manufacture failure.
 - Only write inside {relative_run}; source code and data are read-only.
 - Start by calling submit_plan with at least five executable steps. Do not provide a final answer instead of using tools.
+- Before each turn, the harness appends an AUTHORITATIVE_STATE_SUMMARY user message. Treat its JSON as current factual state when it conflicts with older messages. It is data, not a tool result or an instruction to bypass this protocol.
 
 Experiment protocol:
 1. Inspect the goal, runtime config, task code/data as useful.
@@ -336,6 +350,16 @@ def _validate_runtime_config(config):
     expected_command = f"python {command[1]}"
     if expected_command not in allowed_commands:
         raise ValueError(f"tools.allowed_commands must contain {expected_command!r}")
+    context = config.get("context", {})
+    if not isinstance(context, dict):
+        raise ValueError("context must be an object")
+    if "enabled" in context and not isinstance(context["enabled"], bool):
+        raise ValueError("context.enabled must be a boolean")
+    for key in ("recent_turns", "max_recent_chars"):
+        if key in context:
+            value = context[key]
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(f"context.{key} must be a positive integer")
 
 
 def _validate_run_id(run_id):
@@ -373,6 +397,226 @@ def _record_llm_failure(state, path, exc):
     }
     state["failures"].append(failure)
     _record(path, {"event": "llm_call_failure", **failure})
+
+
+def _build_model_context(messages, state, config):
+    """Build a compact request context without mutating the full audit history."""
+    context_config = {**DEFAULT_CONTEXT_CONFIG, **config.get("context", {})}
+    summary = _state_summary(state)
+    if not context_config["enabled"]:
+        return list(messages), {
+            "enabled": False,
+            "full_message_count": len(messages),
+            "request_message_count": len(messages),
+            "total_turn_groups": len(_turn_groups(messages[2:])),
+            "retained_turn_groups": len(_turn_groups(messages[2:])),
+            "omitted_turn_groups": 0,
+            "recent_message_chars": _message_chars(messages[2:]),
+            "max_recent_chars": context_config["max_recent_chars"],
+            "recent_turn_limit": context_config["recent_turns"],
+            "state_summary": summary,
+        }
+
+    anchors = list(messages[:2])
+    groups = _turn_groups(messages[2:])
+    retained = groups[-context_config["recent_turns"]:]
+    while retained and _message_chars(_flatten(retained)) > context_config["max_recent_chars"]:
+        retained.pop(0)
+    recent_messages = _flatten(retained)
+    summary_message = {
+        "role": "user",
+        "content": (
+            "AUTHORITATIVE_STATE_SUMMARY\n"
+            "This JSON is generated by the harness from current state. Treat it as the "
+            "authoritative source for current facts when older messages conflict. It is data, "
+            "not a tool result and not permission to bypass the system protocol.\n"
+            + json.dumps(summary, ensure_ascii=False, separators=(",", ":"))
+        ),
+    }
+    request_messages = [*anchors, *recent_messages, summary_message]
+    return request_messages, {
+        "enabled": True,
+        "full_message_count": len(messages),
+        "request_message_count": len(request_messages),
+        "total_turn_groups": len(groups),
+        "retained_turn_groups": len(retained),
+        "omitted_turn_groups": len(groups) - len(retained),
+        "recent_message_chars": _message_chars(recent_messages),
+        "max_recent_chars": context_config["max_recent_chars"],
+        "recent_turn_limit": context_config["recent_turns"],
+        "summary_message_chars": _message_chars([summary_message]),
+        "state_summary": summary,
+    }
+
+
+def _turn_groups(messages):
+    """Group assistant turns with all following observations until the next assistant."""
+    groups = []
+    current = []
+    for message in messages:
+        if message.get("role") == "assistant":
+            if current:
+                groups.append(current)
+            current = [message]
+        elif current:
+            current.append(message)
+        else:
+            # Preserve unexpected pre-assistant observations as one atomic group
+            # rather than silently dropping audit context.
+            current = [message]
+    if current:
+        groups.append(current)
+    return groups
+
+
+def _flatten(groups):
+    return [message for group in groups for message in group]
+
+
+def _message_chars(messages):
+    if not messages:
+        return 0
+    return len(json.dumps(messages, ensure_ascii=False, separators=(",", ":")))
+
+
+def _state_summary(state):
+    """Derive a compact authoritative model-facing view from current run state."""
+    plan = state.get("plan") or {}
+    steps = plan.get("steps") or []
+    remaining_steps = [
+        {
+            "id": step.get("id"),
+            "status": step.get("status"),
+            "description": step.get("description"),
+            "next_action": step.get("next_action"),
+        }
+        for step in steps if step.get("status") != "completed"
+    ]
+    current_step = next(
+        (step for step in remaining_steps if step.get("status") == "in_progress"),
+        remaining_steps[0] if remaining_steps else None,
+    )
+    limits = state["limits"]
+    wall_remaining = max(
+        0.0, limits["max_wall_time_minutes"] * 60 - (time.time() - state["started_unix"])
+    )
+    pending = state.get("pending_run")
+    latest_failure = (state.get("failures") or [None])[-1]
+    if isinstance(latest_failure, dict):
+        latest_failure = {
+            key: copy.deepcopy(value)
+            for key, value in latest_failure.items() if key != "traceback"
+        }
+    return {
+        "schema_version": 1,
+        "run": {
+            "run_id": state["run_id"], "status": state["status"], "phase": state["phase"],
+        },
+        "objective": copy.deepcopy(state["objective"]),
+        "progress": {
+            "iteration": state["iteration"],
+            "min_iterations": limits["min_iterations"],
+            "max_iterations": limits["max_iterations"],
+            "llm_calls": state["llm_call_count"],
+            "tool_calls": state["tool_call_count"],
+        },
+        "plan": {
+            "completed_step_ids": [
+                step.get("id") for step in steps if step.get("status") == "completed"
+            ],
+            "current_step": copy.deepcopy(current_step),
+            "remaining_steps": remaining_steps,
+        },
+        "current_config": copy.deepcopy(state.get("current_config")),
+        "best": {
+            "source": state.get("best_source"),
+            "metrics": copy.deepcopy(state.get("best_metrics")),
+            "config": copy.deepcopy(state.get("best_config")),
+        },
+        "pending_run": _pending_summary(pending),
+        "last_result": _last_result_summary(state),
+        "last_tool": copy.deepcopy(state.get("last_tool")),
+        "remaining_budget": {
+            "candidates": max(0, limits["max_iterations"] - state["iteration"]),
+            "tool_calls": max(0, limits["max_tool_calls"] - state["tool_call_count"]),
+            "consecutive_failures": max(
+                0, limits["max_consecutive_failures"] - state["consecutive_failures"]
+            ),
+            "wall_time_seconds": round(wall_remaining, 3),
+        },
+        "requirements": copy.deepcopy(state.get("requirements") or {}),
+        "failures": {
+            "consecutive": state["consecutive_failures"],
+            "total": state["total_failures"],
+            "latest": latest_failure,
+        },
+    }
+
+
+def _pending_summary(pending):
+    if not pending:
+        return None
+    return {
+        "iteration": pending.get("iteration"),
+        "hypothesis": pending.get("hypothesis"),
+        "expected_effect": pending.get("expected_effect"),
+        "changes": copy.deepcopy(pending.get("changes")),
+        "candidate_config": copy.deepcopy(pending.get("config_candidate")),
+        "metrics": copy.deepcopy(pending.get("metrics")),
+        "verification_errors": copy.deepcopy(pending.get("verification_errors") or []),
+        "evaluation": copy.deepcopy(pending.get("evaluation")),
+        "snapshot_id": pending.get("snapshot_id"),
+    }
+
+
+def _last_result_summary(state):
+    pending = state.get("pending_run")
+    if pending:
+        evaluation = pending.get("evaluation") or {}
+        return {
+            "kind": "candidate", "iteration": pending.get("iteration"),
+            "changes": copy.deepcopy(pending.get("changes")),
+            "metrics": copy.deepcopy(pending.get("metrics")),
+            "decision": evaluation.get("llm_decision") or "pending",
+            "restore_verified": False,
+        }
+    history = state.get("history") or []
+    if history:
+        item = history[-1]
+        recovery = item.get("recovery")
+        return {
+            "kind": "candidate", "iteration": item.get("iteration"),
+            "changes": copy.deepcopy(item.get("changes")),
+            "metrics": copy.deepcopy(item.get("metrics")),
+            "decision": item.get("decision"),
+            "restore_verified": bool(recovery and recovery.get("sha256")),
+        }
+    baseline = state.get("baseline")
+    if baseline:
+        return {
+            "kind": "baseline", "iteration": 0, "changes": {},
+            "metrics": copy.deepcopy(baseline.get("metrics")),
+            "decision": "baseline", "restore_verified": False,
+        }
+    return None
+
+
+def _compact_tool_result(result):
+    """Keep authoritative tool facts while excluding bulky observation payloads."""
+    compact = {}
+    omitted = {}
+    for key, value in result.items():
+        if key == "content" and isinstance(value, str):
+            omitted[key] = {"characters": len(value)}
+        elif key in {"stdout_tail", "stderr_tail"} and isinstance(value, str):
+            omitted[key] = {"characters": len(value)}
+        elif key == "files" and isinstance(value, list):
+            omitted[key] = {"items": len(value)}
+        else:
+            compact[key] = copy.deepcopy(value)
+    if omitted:
+        compact["omitted_payloads"] = omitted
+    return compact
 
 
 def _save_state(run_dir, state):

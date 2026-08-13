@@ -10,6 +10,7 @@ The LLM decides what to investigate and which experiment to try next. The Python
 - **Bounded autonomy:** the search space, filesystem access, command execution, experiment count, tool-call count, and runtime are explicitly limited.
 - **Independent verification:** process status, metric files, candidate configurations, comparisons, rollbacks, and the final report are checked by deterministic code.
 - **Recoverable iteration:** each candidate starts from a snapshot of the last accepted configuration, allowing regressions to be rolled back and verified.
+- **State-aware context:** every model request receives an authoritative state summary plus a bounded window of recent complete tool-call turns.
 - **Complete traceability:** model messages, tool calls, configurations, logs, metrics, state transitions, and reports are persisted under a unique run directory.
 
 For a detailed architecture and experiment analysis, see [Report.md](Report.md).
@@ -31,6 +32,7 @@ The Flappy Bird task automatically uses SDL's `dummy` video and audio drivers, s
 The default runtime configuration is [configs/autoresearch.yaml](configs/autoresearch.yaml). It defines:
 
 - the OpenAI-compatible provider, model, endpoint, timeout, and retry policy;
+- the model-facing context window and state-summary controls;
 - the natural-language goal, experiment command, input data, and metrics path;
 - the optimization objective, baseline, and allowed hyperparameter values;
 - candidate, tool-call, failure, wall-clock, and subprocess budgets;
@@ -89,6 +91,19 @@ The agent follows an explicit plan–act–observe–validate loop:
 6. The harness independently checks the decision and verifies any requested snapshot restoration.
 7. The agent updates its plan, writes the final report, and requests completion.
 
+Before each model call, the harness builds a compact request context from the fixed system prompt and original goal, up to four recent complete assistant/tool turn groups, and a machine-generated JSON `AUTHORITATIVE_STATE_SUMMARY`. The recent groups are limited to 24,000 serialized characters by default and are removed oldest-first without splitting an assistant tool call from its corresponding tool result. The summary exposes current plan progress, accepted and pending configurations, best metrics, the last experiment result, a compact latest-tool observation, completion requirements, failures, and budgets directly from authoritative state.
+
+These controls are configured under `context`:
+
+```yaml
+context:
+  enabled: true
+  recent_turns: 4
+  max_recent_chars: 24000
+```
+
+Set `enabled: false` to restore full-history model requests for compatibility or diagnosis. This compaction is character-based and does not replace model-specific token budgeting.
+
 The model must issue exactly one native tool call per turn. The available tools are:
 
 | Tool | Purpose |
@@ -141,6 +156,7 @@ runs/<run_id>/
   llm_calls/call_XXX/
     request.json
     response.json
+    context.json
   tool_calls/call_XXX_<tool>/
     arguments.json
     result.json
@@ -161,7 +177,7 @@ The main records serve different purposes:
 - `state.json` is the latest structured state-machine snapshot.
 - `messages.jsonl` contains the complete system, user, assistant, and tool conversation.
 - `trajectory.jsonl` records decisions, arguments, results, errors, recovery actions, and terminal events.
-- `llm_calls/` preserves the exact request and raw response for each model call.
+- `llm_calls/` preserves the exact compact request and raw response for each model call; `context.json` records the authoritative summary and compaction statistics used to construct that request.
 - `tool_calls/` preserves the arguments and structured result for each tool call.
 - baseline and iteration directories contain configurations, execution metadata, metrics, logs, and raw training/evaluation artifacts.
 

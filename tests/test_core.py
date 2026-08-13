@@ -11,7 +11,10 @@ from unittest.mock import patch
 
 from openai.types.chat import ChatCompletion
 
-from autoresearch.agent import _initial_state, _validate_runtime_config, run_agent
+from autoresearch.agent import (
+    _build_model_context, _compact_tool_result, _initial_state, _state_summary,
+    _validate_runtime_config, run_agent,
+)
 from autoresearch.execution import compare_metrics, load_yaml, verify_execution, write_yaml
 from autoresearch.planner import PlannerError, _normalize_assistant_message, chat, parse_tool_call
 from autoresearch.progress import ProgressReporter, tool_summary
@@ -129,6 +132,129 @@ class CoreTests(unittest.TestCase):
         config["planner"]["provider"] = "local_command"
         with self.assertRaisesRegex(ValueError, "openai_compatible"):
             _validate_runtime_config(config)
+
+    def test_context_configuration_requires_valid_types_and_positive_limits(self):
+        """Reject ambiguous context controls before an agent run starts."""
+        config = _integration_config()
+        for context, message in (
+            ({"enabled": "yes"}, "context.enabled"),
+            ({"recent_turns": 0}, "context.recent_turns"),
+            ({"max_recent_chars": True}, "context.max_recent_chars"),
+        ):
+            candidate = dict(config)
+            candidate["context"] = context
+            with self.assertRaisesRegex(ValueError, message):
+                _validate_runtime_config(candidate)
+
+    def test_state_summary_exposes_authoritative_pending_budget_and_recovery_facts(self):
+        """Derive current facts directly from state instead of conversation history."""
+        config = _integration_config()
+        state = _initial_state("summary", "improve score", config)
+        state["plan"] = {"steps": [
+            {"id": "inspect", "status": "completed", "description": "Inspect", "next_action": ""},
+            {"id": "run", "status": "in_progress", "description": "Run candidate", "next_action": "Evaluate"},
+        ]}
+        state["phase"] = "experiment"
+        state["iteration"] = 4
+        state["tool_call_count"] = 21
+        state["llm_call_count"] = 22
+        state["current_config"] = {"learning_rate": 0.6}
+        state["best_config"] = {"learning_rate": 0.6}
+        state["best_metrics"] = {"status": "success", "score": 10.96}
+        state["best_source"] = "iteration_02"
+        state["pending_run"] = {
+            "iteration": 4, "hypothesis": "try exploration", "expected_effect": "higher score",
+            "changes": {"epsilon": 0.01}, "config_candidate": {"learning_rate": 0.6, "epsilon": 0.01},
+            "metrics": {"status": "success", "score": 6.71}, "verification_errors": [],
+            "snapshot_id": "iteration_04_before.yaml", "evaluation": {
+                "llm_decision": "rollback", "harness_decision": "rollback",
+            },
+        }
+        summary = _state_summary(state)
+        self.assertEqual(summary["run"]["phase"], "experiment")
+        self.assertEqual(summary["progress"]["iteration"], 4)
+        self.assertEqual(summary["best"]["metrics"]["score"], 10.96)
+        self.assertEqual(summary["pending_run"]["snapshot_id"], "iteration_04_before.yaml")
+        self.assertEqual(summary["last_result"]["decision"], "rollback")
+        self.assertFalse(summary["last_result"]["restore_verified"])
+        self.assertEqual(summary["remaining_budget"]["candidates"], 1)
+        self.assertEqual(summary["remaining_budget"]["tool_calls"], 9)
+        self.assertEqual(summary["plan"]["current_step"]["id"], "run")
+
+        state["pending_run"] = None
+        state["history"] = [{
+            "iteration": 4, "changes": {"epsilon": 0.01},
+            "metrics": {"status": "success", "score": 6.71}, "decision": "rollback",
+            "recovery": {"snapshot_id": "iteration_04_before.yaml", "sha256": "abc"},
+        }]
+        restored = _state_summary(state)
+        self.assertIsNone(restored["pending_run"])
+        self.assertTrue(restored["last_result"]["restore_verified"])
+
+    def test_state_summary_compacts_bulky_last_tool_payloads(self):
+        """Preserve the latest tool outcome without copying large content into every prompt."""
+        state = _initial_state("last-tool", "goal", _integration_config())
+        state["last_tool"] = {
+            "name": "read_file", "tool_call": 3, "ok": True,
+            "result": {
+                "ok": True, "path": "task/source.py", "content": "x" * 12000,
+                "stdout_tail": "log", "files": [{"path": "a"}, {"path": "b"}],
+            },
+        }
+        state["last_tool"]["result"] = _compact_tool_result(state["last_tool"]["result"])
+        summary = _state_summary(state)
+        result = summary["last_tool"]["result"]
+        self.assertEqual(result["path"], "task/source.py")
+        self.assertNotIn("content", result)
+        self.assertEqual(result["omitted_payloads"]["content"]["characters"], 12000)
+        self.assertEqual(result["omitted_payloads"]["files"]["items"], 2)
+
+    def test_context_window_keeps_complete_recent_turns_and_authoritative_summary(self):
+        """Compact history without orphaning tool results or dropping Kimi reasoning fields."""
+        state = _initial_state("window", "goal", _integration_config())
+        messages = [{"role": "system", "content": "policy"}, {"role": "user", "content": "goal"}]
+        for index in range(1, 6):
+            messages.extend([
+                {
+                    "role": "assistant", "content": "", "reasoning_content": f"reason-{index}",
+                    "tool_calls": [{
+                        "id": f"call_{index}", "type": "function",
+                        "function": {"name": "read_file", "arguments": "{}"},
+                    }],
+                },
+                {"role": "tool", "tool_call_id": f"call_{index}", "name": "read_file", "content": "ok"},
+            ])
+        config = _integration_config()
+        config["context"] = {"enabled": True, "recent_turns": 4, "max_recent_chars": 24000}
+        compact, record = _build_model_context(messages, state, config)
+        self.assertEqual(record["total_turn_groups"], 5)
+        self.assertEqual(record["retained_turn_groups"], 4)
+        self.assertEqual(record["omitted_turn_groups"], 1)
+        self.assertNotIn("reason-1", json.dumps(compact))
+        self.assertIn("reason-5", json.dumps(compact))
+        assistant_ids = {
+            call["id"] for message in compact if message.get("role") == "assistant"
+            for call in message.get("tool_calls") or []
+        }
+        tool_ids = {
+            message["tool_call_id"] for message in compact if message.get("role") == "tool"
+        }
+        self.assertEqual(assistant_ids, tool_ids)
+        self.assertEqual(compact[-1]["role"], "user")
+        self.assertIn("AUTHORITATIVE_STATE_SUMMARY", compact[-1]["content"])
+        injected_summary = json.loads(compact[-1]["content"].split("\n", 2)[-1])
+        self.assertEqual(injected_summary, record["state_summary"])
+        self.assertNotIn(compact[-1], messages)
+
+        config["context"]["max_recent_chars"] = 1
+        minimal, minimal_record = _build_model_context(messages, state, config)
+        self.assertEqual([message["role"] for message in minimal], ["system", "user", "user"])
+        self.assertEqual(minimal_record["retained_turn_groups"], 0)
+
+        config["context"]["enabled"] = False
+        full, full_record = _build_model_context(messages, state, config)
+        self.assertEqual(full, messages)
+        self.assertFalse(full_record["enabled"])
 
     def test_execution_verification_and_comparison_are_independent(self):
         """Ensure deterministic checks can reject misleading experiment output."""
@@ -277,6 +403,27 @@ class AgentIntegrationTests(unittest.TestCase):
             self.assertTrue((root / "runs" / run_id / "tool_calls").is_dir())
             self.assertIn('"event": "tool_call"', (root / "runs" / run_id / "trajectory.jsonl").read_text(encoding="utf-8"))
             self.assertTrue(fake.reasoning_was_replayed)
+            full_messages = [
+                json.loads(line) for line in
+                (root / "runs" / run_id / "messages.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+            final_llm_dir = root / "runs" / run_id / "llm_calls" / "call_021"
+            request = json.loads((final_llm_dir / "request.json").read_text(encoding="utf-8"))
+            context = json.loads((final_llm_dir / "context.json").read_text(encoding="utf-8"))
+            self.assertEqual(len(full_messages), 44)
+            self.assertLess(len(request["messages"]), context["full_message_count"])
+            self.assertEqual(len(request["messages"]), context["request_message_count"])
+            self.assertEqual(context["retained_turn_groups"], 4)
+            self.assertGreater(context["omitted_turn_groups"], 0)
+            self.assertIn("AUTHORITATIVE_STATE_SUMMARY", request["messages"][-1]["content"])
+            self.assertEqual(context["state_summary"]["progress"]["iteration"], 3)
+            self.assertEqual(context["state_summary"]["best"]["metrics"]["score"], 7.0)
+            self.assertEqual(context["state_summary"]["last_tool"]["name"], "update_plan")
+            self.assertFalse(any(
+                message.get("role") == "user"
+                and message.get("content", "").startswith("AUTHORITATIVE_STATE_SUMMARY")
+                for message in full_messages
+            ))
             progress = progress_stream.getvalue()
             for event in ("LLM", "TOOL", "FILE", "EXP", "CHECK", "RECOVER", "DONE"):
                 self.assertIn(event, progress)
@@ -347,6 +494,7 @@ def _integration_config():
     return {
         "goal_file": "task/goal.md",
         "planner": {"provider": "openai_compatible", "model": "test-model"},
+        "context": {"enabled": True, "recent_turns": 4, "max_recent_chars": 24000},
         "budget": {
             "min_iterations": 3, "max_iterations": 5, "max_tool_calls": 30,
             "max_consecutive_failures": 3, "max_wall_time_minutes": 2,

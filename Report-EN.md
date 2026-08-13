@@ -1,7 +1,7 @@
 # Mini AutoResearch Agent: Technical Report on a Controlled Autonomous Reinforcement-Learning Experiment System
 
 > **Report scope and evidence baseline**  
-> This report analyzes the design and implementation of the Mini AutoResearch Agent and one complete experimental run. Statements about the system are based on the source code and `configs/autoresearch.yaml`; statements about experimental outcomes use only `runs/research_agent_003`, whose status is `completed` and whose completion requirements were verified by the harness. At the time of analysis, the repository `HEAD` was `94c5f8af464f557c05ffa1f03cc503de99dff5dd`, and validation was performed on 2026-08-13. Unless explicitly labeled as an interpretation, hypothesis, or limitation, this report does not treat subjective LLM judgments as system facts.
+> This report analyzes the design and implementation of the Mini AutoResearch Agent and one complete experimental run. Statements about the system are based on the source code and `configs/autoresearch.yaml` in the current working tree; statements about experimental outcomes use only `runs/research_agent_003`, whose status is `completed` and whose completion requirements were verified by the harness. That historical run corresponds to repository `HEAD` `94c5f8af464f557c05ffa1f03cc503de99dff5dd`. Validation was performed on 2026-08-13. Unless explicitly labeled as an interpretation, hypothesis, or limitation, this report does not treat subjective LLM judgments as system facts.
 
 **Contents:** [Introduction](#introduction) · [System Architecture](#system-architecture) · [Autonomous Experimentation Workflow](#autonomous-experimentation-workflow) · [Key Design Decisions](#key-design-decisions-and-safety-mechanisms) · [Experiments and Results](#experiments-and-results) · [Limitations and Future Improvements](#failure-cases-limitations-and-future-improvements) · [Conclusion](#conclusion) · [Evidence Index](#evidence-index)
 
@@ -58,7 +58,7 @@ Natural-language goal + runtime configuration
 
 Two complementary data paths run through this architecture:
 
-1. **Interaction path:** system, user, assistant, and tool messages form the LLM's decision context.
+1. **Interaction path:** the system prompt, original goal, recent assistant/tool turns, and authoritative state summary form the LLM's decision context.
 2. **Evidence path:** configuration, subprocess state, metric files, snapshots, and structured state form the harness's authoritative evidence.
 
 Neither path replaces the other. The LLM may interpret a tool result, but it cannot directly declare that result verified. Only facts recalculated and accepted by the harness from files and process state may update the best configuration or allow the run to finish.
@@ -67,9 +67,9 @@ Neither path replaces the other. The LLM may interpret a tool result, but it can
 
 #### LLM Agent / Planner
 
-The LLM Agent is the system's decision-maker. It turns a natural-language research goal into an executable experiment process, but it cannot read or write files or start processes directly. At the beginning of a run, `agent.py` builds a system prompt containing the research objective, run directory, target metric, experiment count, rollback requirement, file permissions, and complete experiment protocol. The model must first submit a plan with at least five steps. It then selects one action per turn using the full conversation history, tool observations, current best metrics, and failure information.
+The LLM Agent is the system's decision-maker. It turns a natural-language research goal into an executable experiment process, but it cannot read or write files or start processes directly. At the beginning of a run, `agent.py` builds a system prompt containing the research objective, run directory, target metric, experiment count, rollback requirement, file permissions, and complete experiment protocol. The model must first submit a plan with at least five steps. It then selects one action per turn using a machine-generated authoritative state summary, recent complete tool turns, and the current observation.
 
-The Planner invokes the configured model through an OpenAI-compatible Chat Completions API. Each request includes the message history and native function-calling schemas, with `tool_choice="required"` and `parallel_tool_calls=False`. The model must therefore choose exactly one tool per turn, creating a clear decision–execution–observation boundary. `planner.py` normalizes the response and parses the tool name, call ID, and JSON arguments. Kimi/DashScope-specific `reasoning_content` is also preserved and replayed in later turns.
+The Planner invokes the configured model through an OpenAI-compatible Chat Completions API. Each request includes compact model-facing context and native function-calling schemas, with `tool_choice="required"` and `parallel_tool_calls=False`. The model must therefore choose exactly one tool per turn, creating a clear decision–execution–observation boundary. `planner.py` normalizes the response and parses the tool name, call ID, and JSON arguments. Kimi/DashScope-specific `reasoning_content` is preserved and replayed together with assistant turns retained in the recent window.
 
 The LLM performs the following cognitive tasks:
 
@@ -121,6 +121,7 @@ Trace data are separated by purpose:
 - `messages.jsonl` stores the complete system, user, assistant, and tool conversation;
 - `trajectory.jsonl` stores tool decisions, arguments, results, errors, recovery actions, and stop events;
 - `llm_calls/call_XXX/` stores each exact request and raw response; the request is written before the network call, so a stalled request remains diagnosable;
+- `llm_calls/call_XXX/context.json` stores the authoritative summary, complete/request message counts, and window-compaction statistics for that call;
 - `tool_calls/call_XXX_<tool>/` stores each tool's arguments and structured result;
 - the baseline and iteration directories store configurations, execution metadata, metrics, stdout/stderr, and raw train/evaluation artifacts.
 
@@ -164,6 +165,7 @@ The main configuration settings are:
 | Category | Current setting | Purpose |
 |---|---|---|
 | Planner | `kimi/kimi-k3`, OpenAI-compatible endpoint, `temperature=0.2` | Produces native tool-call decisions |
+| Context | 4 recent complete turns, at most 24,000 characters, authoritative JSON summary on every call | Bounds history growth and exposes current facts directly |
 | API authentication | `DASHSCOPE_API_KEY` environment variable | Keeps the key out of configuration and run artifacts |
 | Primary objective | Maximize `mean_score`, target 5.0 | Determines whether a candidate improves on the current best |
 | Tie-breaker | `mean_reward` | Used only when the primary metric does not exceed the minimum-improvement threshold |
@@ -218,24 +220,25 @@ Context is collected on demand. The Agent may list approved directories and read
 
 #### Overall Strategy
 
-The project combines a complete in-memory message history, structured state on disk, and a full audit log. Model conversation and experiment state remain separate: the LLM uses message history to understand the task, while the Python Harness maintains authoritative structured state and validates every transition.
+The project combines a complete audit history, a bounded request window, and an authoritative state summary. Model conversation and experiment state remain separate: the Python Harness maintains authoritative structured state and validates every transition, then derives a compact JSON summary that exposes current facts directly to the LLM before each request.
 
 ```text
-system prompt + user goal
-          ↓
-   in-memory messages list
-          ↓ sent in full on every turn
-LLM response → tool call → tool result
-          └──────── appended to messages
-                         ↓
-       messages.jsonl / state.json / trajectory.jsonl
+complete messages ───────────→ messages.jsonl (full audit)
+        │
+        ├─ system prompt + original goal
+        ├─ 4 recent complete assistant/tool turns (≤ 24,000 chars)
+state ───→ AUTHORITATIVE_STATE_SUMMARY (JSON)
+        │
+        └────────────────────→ model request
+                                  ↓
+                         request.json + context.json
 ```
 
 #### Conversation and State
 
-Every run starts with a system prompt and a natural-language goal. On each subsequent turn, the full `messages` list is sent to the model, after which the model response and tool result are appended. Conversation context is therefore append-only and is neither pruned nor windowed. The project also retains Kimi/DashScope `reasoning_content` and replays it in later requests to preserve reasoning continuity.
+Every run still begins with a fixed system prompt and natural-language goal. Model responses and tool results remain append-only in the in-memory `messages` list and `messages.jsonl`, but network requests no longer replay the entire history. The Harness treats an assistant message and its following tool result or correction user message as an indivisible turn group. It retains at most the four newest groups; if their serialized form exceeds 24,000 characters, it removes the oldest groups whole. This prevents a tool result from appearing without the assistant `tool_calls` that produced it. Kimi/DashScope `reasoning_content` is replayed with each retained assistant turn.
 
-In parallel, the Harness maintains an independent `state` machine containing the current phase, research plan, baseline, current and best configurations, experiment metrics, pending and historical experiments, failures, rollback events, and all budgets. This state is authoritative. The LLM cannot modify it directly; it can only trigger transitions through controlled tools. The complete `state` object is not reinjected into every model turn. Instead, the model tracks progress primarily through the existing conversation and tool results.
+Before every model call, the Harness derives an authoritative `schema_version=1` summary from `state`. It includes run phase, iteration progress, plan status, complete current and best configurations, best metrics, the pending candidate, last experiment result, a compact latest-tool observation, completion requirements, failures, and live remaining budgets. The latest-tool observation excludes file bodies, log tails, and large file lists while retaining outcomes, paths, hashes, metrics, next actions, and omitted-payload sizes. The model therefore still sees whether a tool succeeded even when an oversized turn is removed as a whole. The summary is appended to the request as a temporary user JSON message and states that it takes precedence when older messages conflict. This derived message is not appended to `messages.jsonl`. The LLM still cannot modify authoritative state directly; only controlled tools may trigger transitions.
 
 #### Persistence and Traceability
 
@@ -245,15 +248,16 @@ Each run directory preserves the following context records:
 - `state.json`: the latest structured runtime state;
 - `trajectory.jsonl`: tool calls, decisions, errors, recoveries, and next actions;
 - `llm_calls/call_XXX/`: the complete request and raw response for each model call;
+- `llm_calls/call_XXX/context.json`: the summary, retained/omitted turn counts, character use, and message counts for that call;
 - `tool_calls/call_XXX_<tool>/`: arguments and results for each tool invocation.
 
-These records support replay, audit, and fault diagnosis. They are currently record-only, however: the project does not provide an entry point that automatically resumes an interrupted task from `state.json` and `messages.jsonl`. Calling `run_agent()` again creates a new run directory and context.
+`request.json` represents the compact context actually shown to the model, while `messages.jsonl` represents the complete unpruned interaction; `context.json` connects them with construction metadata. These records support replay, audit, and fault diagnosis. The project still does not provide an entry point that automatically resumes an interrupted task from `state.json` and `messages.jsonl`; calling `run_agent()` again creates a new run. Historical run `research_agent_003` predates this feature and therefore has no `context.json` files. Its experimental metrics are unaffected by the context-layer change.
 
 #### Context Growth and Limitations
 
-The project slows context growth by bounding individual tool results: a file read returns at most 500 lines and 12,000 characters by default, file lists contain at most 200 items, and experiment commands return only stdout and stderr tails to the model. Limits of 40 tool calls, five candidate experiments, and 30 minutes also indirectly bound total context size.
+The project bounds both individual observations and cumulative recent history. A file read returns at most 500 lines and 12,000 characters by default, file lists contain at most 200 items, experiment commands return only stdout and stderr tails, and model requests retain no more than four complete recent turns totaling at most 24,000 characters. Setting `context.enabled=false` restores full-history requests for compatibility or diagnosis.
 
-The implementation reads and displays the API's `total_tokens`, but does not enforce a separate token or context budget. It has no pre-request token estimation, historical summarization or sliding window, old tool-output eviction, specialized recovery from a context-limit error, or cross-process resume capability. The design is transparent and auditable for the current short experimental workflow; longer tasks should add token-budget monitoring, layered summaries, and persistent recovery.
+The window is measured in serialized JSON characters, not exact model tokenizer units. The fixed system prompt, original goal, tool schemas, and state summary are also outside `max_recent_chars`. The system still has no pre-request token estimate, specialized context-limit recovery, or cross-process resume capability. Longer tasks should add model-aware token budgeting, a summary-size bound, long-term semantic memory for evicted rationale, and persistent recovery.
 
 ### Plan–Act–Observe–Validate Loop
 
@@ -319,7 +323,7 @@ The system treats `state` as the authoritative state machine for one run and ove
 
 Persistence supports three levels of reconstruction:
 
-1. **Reconstructing the model's view:** `messages.jsonl` and per-call `request.json` answer what the model had seen at a particular time.
+1. **Reconstructing the model's view:** `request.json` shows the exact compact context received by the model, `context.json` explains its summary and compaction, and `messages.jsonl` retains the full unpruned interaction.
 2. **Reconstructing system actions:** `trajectory.jsonl` and tool directories answer what was called and what it returned.
 3. **Reconstructing experimental facts:** configurations, metrics, execution metadata, logs, and Q-tables under the baseline and iteration directories answer what actually ran and what it produced.
 
@@ -349,7 +353,7 @@ The regression suite provides corresponding safeguards. On 2026-08-13, the follo
 python -m unittest discover -s tests -v
 ```
 
-All eight tests passed. Coverage includes native tool-call parsing and Kimi reasoning replay, OpenAI SDK arguments, progress heartbeats and content non-disclosure, minimum runtime requirements, independent execution and metric comparison, report evidence validation, rejection of out-of-run writes and early completion, and an end-to-end state-machine test with a baseline, three candidates, and a real rollback. These results support correct operation of the core control logic, but do not prove coverage of every operating system, model provider, or long-duration failure mode.
+All twelve tests passed. Coverage includes native tool-call parsing and Kimi reasoning replay, context-configuration validation, authoritative state summaries, atomic assistant/tool windows, large-payload compaction for the latest tool observation, disabled-mode compatibility, OpenAI SDK arguments, progress heartbeats and content non-disclosure, minimum runtime requirements, independent execution and metric comparison, report evidence validation, rejection of out-of-run writes and early completion, and an end-to-end state-machine test with a baseline, three candidates, a real rollback, and compaction audit records. These results support correct operation of the control and context logic, but do not prove coverage of every operating system, model provider, or long-duration failure mode.
 
 ### Rollback and Recovery Mechanism
 
@@ -511,7 +515,8 @@ A successful tool call resets the consecutive-failure counter and may record a p
 
 #### Context and Durability
 
-- The full message history is resent on every turn, with no token budget, summarization, sliding window, or context-limit recovery.
+- The authoritative state summary and character-budgeted sliding window are implemented, but 24,000 characters are only a proxy for token usage, and the summary itself has no independent size limit.
+- The window retains at most four recent turns. Earlier source observations and research rationale may leave the request; factual state is preserved by the summary, but it is not a substitute for long-term semantic memory.
 - `messages.jsonl`, `state.json`, and per-call requests are auditable, but `run_agent()` cannot resume an interrupted run from these records.
 - `state.json` is overwritten normally rather than written to a temporary file and atomically replaced, so an extreme power loss or process interruption could leave a partial write.
 - Run records preserve complete prompts, model responses, and tool observations. Although API keys are not persisted, a run directory still requires content and privacy review before public distribution.
@@ -533,7 +538,7 @@ The following work is recommended in priority order:
 3. **Improve experimental design.** Split multi-parameter candidates into ablations or adopt budget-constrained Bayesian optimization or successive halving while retaining independent Harness validation.
 4. **Capture the complete environment.** Record source commit, dirty-worktree status, exact Python and dependency versions, platform, and hardware for every run; provide a lockfile or container definition.
 5. **Implement a resumable state machine.** Save state with atomic replacement, create a consistent checkpoint per turn, and resume from `state.json + messages.jsonl` after verifying the last tool call, `pending_run`, and on-disk artifacts.
-6. **Manage long context.** Estimate tokens before requests, retain recent messages plus a lossless state summary, compress old tool output into structured evidence with file references, and recover from context-length errors.
+6. **Deepen long-context management.** Add model-tokenizer estimates, a summary-size cap, and context-length error recovery on top of the existing authoritative summary and character window; compress evicted research rationale into long-term semantic memory with file references.
 7. **Strengthen report validation.** Generate result tables and key figures directly from `state.json`, or compare machine-readable report front matter field-by-field with state; reserve natural language for interpretation rather than manual transcription of core metrics.
 8. **Increase isolation and resource control.** Run experiments in a container or low-privilege process, impose CPU, memory, disk, and process-tree limits, and scan public artifacts automatically for secrets and private information.
 9. **Expand fault testing.** Add fault-injection cases for timeout, corrupted metrics, missing snapshots, interrupted state writes, consecutive API failures, context overflow, and cross-platform paths.
@@ -543,7 +548,7 @@ The following work is recommended in priority order:
 
 Mini AutoResearch Agent demonstrates an autonomous experiment design with clear boundaries: the LLM performs planning and research judgment, while the Python Harness performs real execution, constraint enforcement, verification, and evidence persistence. Its value comes not from granting the model unlimited execution privileges, but from embedding open-ended model reasoning inside a deterministic state machine that can reject actions, recover from regressions, and preserve an audit trail.
 
-The only run that completed and passed every completion requirement, `research_agent_003`, increased Flappy Bird Q-learning `mean_score` from 5.20 to 14.31 under its fixed seed and evaluation protocol. It also performed verified snapshot rollback for two legal but regressing candidates. All eight existing automated tests passed, supporting correctness of the core control logic. At the same time, a single seed, high variance, a metric-aggregation defect, linear context growth, lack of resume support, and incomplete environment locking limit the strength of the conclusions.
+The only run that completed and passed every completion requirement, `research_agent_003`, increased Flappy Bird Q-learning `mean_score` from 5.20 to 14.31 under its fixed seed and evaluation protocol. It also performed verified snapshot rollback for two legal but regressing candidates. All twelve automated tests passed, supporting the core control logic and the new authoritative-summary/sliding-window behavior. At the same time, a single seed, high variance, a metric-aggregation defect, lack of exact token budgeting and resume support, and incomplete environment locking limit the strength of the conclusions.
 
 The current system therefore qualifies as a small-scale, controlled, and auditable autonomous experimentation prototype. Before it is used for longer, more expensive, or public benchmark studies, metric correctness, multi-seed statistical validation, environment capture, atomic recovery, and stronger isolation should be addressed. The best result in this report should be understood as the best observed result from one complete run, not as an unqualified statement of algorithmic performance.
 

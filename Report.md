@@ -1,7 +1,7 @@
 # Mini AutoResearch Agent：受控自主强化学习实验系统技术报告
 
 > **报告范围与证据基线**  
-> 本报告分析仓库中 Mini AutoResearch Agent 的设计、实现和一次完整实验运行。代码事实以源代码和 `configs/autoresearch.yaml` 为依据；实验事实只采用状态为 `completed` 且通过 Harness 完成校验的 `runs/research_agent_003`。分析时仓库 `HEAD` 为 `94c5f8af464f557c05ffa1f03cc503de99dff5dd`，验证日期为 2026-08-13。除明确标记为“解释”“假设”或“局限”的内容外，本文不把 LLM 的主观判断当作系统事实。
+> 本报告分析仓库中 Mini AutoResearch Agent 的设计、实现和一次完整实验运行。代码事实以当前工作树中的源代码和 `configs/autoresearch.yaml` 为依据；实验事实只采用状态为 `completed` 且通过 Harness 完成校验的 `runs/research_agent_003`，该历史运行对应的仓库 `HEAD` 为 `94c5f8af464f557c05ffa1f03cc503de99dff5dd`。验证日期为 2026-08-13。除明确标记为“解释”“假设”或“局限”的内容外，本文不把 LLM 的主观判断当作系统事实。
 
 **Contents:** [Introduction](#introduction) · [System Architecture](#system-architecture) · [Autonomous Experimentation Workflow](#autonomous-experimentation-workflow) · [Key Design Decisions](#key-design-decisions-and-safety-mechanisms) · [Experiments and Results](#experiments-and-results) · [Limitations and Future Improvements](#failure-cases-limitations-and-future-improvements) · [Conclusion](#conclusion) · [Evidence Index](#evidence-index)
 
@@ -58,7 +58,7 @@ Mini AutoResearch Agent 是一个面向小规模机器学习实验的自主研�
 
 该架构中存在两条互补的数据链：
 
-1. **交互链：** system/user/assistant/tool 消息构成 LLM 的决策上下文；
+1. **交互链：** system prompt、原始目标、近期 assistant/tool 回合与权威状态摘要构成 LLM 的决策上下文；
 2. **事实链：** 配置、子进程状态、指标文件、快照和 `state` 构成 Harness 的权威证据。
 
 两条链不会相互替代。LLM 可以解释工具结果，却不能直接把某个结果写成“已验证”；只有 Harness 从文件和进程状态中重新计算并接受的事实，才会更新当前最佳配置或允许运行结束。
@@ -67,9 +67,9 @@ Mini AutoResearch Agent 是一个面向小规模机器学习实验的自主研�
  
 #### LLM Agent / Planner
 
-LLM Agent 是系统中的决策者，负责把自然语言研究目标转化为可执行的实验过程，但不直接读写文件或启动进程。运行开始时，`agent.py` 构造 system prompt，向模型明确研究目标、运行目录、目标指标、实验次数、回滚要求、文件权限和完整实验协议。模型首先必须提交至少五步的研究计划，随后根据完整对话历史、工具观察、当前最佳指标和失败信息，逐轮选择下一项操作。
+LLM Agent 是系统中的决策者，负责把自然语言研究目标转化为可执行的实验过程，但不直接读写文件或启动进程。运行开始时，`agent.py` 构造 system prompt，向模型明确研究目标、运行目录、目标指标、实验次数、回滚要求、文件权限和完整实验协议。模型首先必须提交至少五步的研究计划，随后根据机器生成的权威状态摘要、近期完整工具回合和当前观察，逐轮选择下一项操作。
 
-Planner 通过 OpenAI-compatible Chat Completions 接口调用配置的模型。每次请求均携带消息历史和原生 function-calling schemas，并强制设置 `tool_choice="required"`、`parallel_tool_calls=False`。因此，模型每轮必须且只能选择一个工具，形成清晰的“决策—执行—观察”边界。模型输出由 `planner.py` 规范化并解析为工具名称、调用 ID 和 JSON 参数；Kimi/DashScope 的 `reasoning_content` 也会保留并在后续轮次中回放。
+Planner 通过 OpenAI-compatible Chat Completions 接口调用配置的模型。每次请求均携带精简后的模型上下文和原生 function-calling schemas，并强制设置 `tool_choice="required"`、`parallel_tool_calls=False`。因此，模型每轮必须且只能选择一个工具，形成清晰的“决策—执行—观察”边界。模型输出由 `planner.py` 规范化并解析为工具名称、调用 ID 和 JSON 参数；近期窗口内 Kimi/DashScope 的 `reasoning_content` 会随对应 assistant 回合一起保留和回放。
 
 LLM 主要承担以下认知任务：
 
@@ -121,6 +121,7 @@ Runner 为 pygame 设置 dummy video/audio driver，从而支持无界面的自�
 - `messages.jsonl` 保存完整的 system/user/assistant/tool 对话；
 - `trajectory.jsonl` 保存工具决策、参数、结果、错误、恢复动作和停止事件；
 - `llm_calls/call_XXX/` 保存每次实际请求与原始响应，请求在网络调用前写入，因而模型请求卡死时仍可诊断；
+- `llm_calls/call_XXX/context.json` 保存该轮权威状态摘要、完整/请求消息数量和窗口裁剪统计；
 - `tool_calls/call_XXX_<tool>/` 保存每次工具的参数和结构化结果；
 - baseline 和各 iteration 目录保存配置、执行信息、指标、stdout/stderr 及原始训练/评估产物。
 
@@ -164,6 +165,7 @@ Validator 是独立于 LLM 判断的确定性证据检查层，贯穿初始化�
 | 类别 | 当前设置 | 作用 |
 |---|---|---|
 | Planner | `kimi/kimi-k3`，OpenAI-compatible endpoint，`temperature=0.2` | 提供原生工具调用决策 |
+| 上下文 | 最近 4 个完整回合、最多 24,000 字符、每轮注入权威 JSON 摘要 | 限制历史增长并直接暴露当前事实 |
 | API 认证 | 环境变量 `DASHSCOPE_API_KEY` | 密钥不进入配置和运行产物 |
 | 主目标 | 最大化 `mean_score`，目标值 5.0 | 决定候选是否优于当前最佳 |
 | 同分指标 | `mean_reward` | 仅当主指标未超过最小改进阈值时参与比较 |
@@ -218,24 +220,25 @@ system prompt 不只描述目标，还给出强制实验协议：先提交计划
 
 #### Overall Strategy
 
-当前工程采用“内存全量消息历史 + 磁盘结构化状态 + 完整审计日志”的上下文管理方式。模型对话与实验状态相互分离：LLM 通过消息历史理解任务过程，Python Harness 维护权威的结构化状态并验证所有状态迁移。
+当前工程采用“完整审计历史 + 有界请求窗口 + 权威状态摘要”的上下文管理方式。模型对话与实验状态仍然分离：Python Harness 维护权威结构化状态并验证全部状态迁移；每次请求前，再从该状态生成小型 JSON 摘要，直接向 LLM 提供当前事实。
 
 ```text
-system prompt + 用户目标
-          ↓
-   内存 messages 列表
-          ↓ 每轮完整发送
-LLM 回复 → 工具调用 → 工具结果
-          └────────追加回 messages
-                       ↓
-       messages.jsonl / state.json / trajectory.jsonl
+完整 messages ───────────────→ messages.jsonl（全量审计）
+      │
+      ├─ system prompt + 原始目标
+      ├─ 最近 4 个完整 assistant/tool 回合（≤ 24,000 字符）
+state ──→ AUTHORITATIVE_STATE_SUMMARY（JSON）
+      │
+      └──────────────────────→ 本轮模型请求
+                                  ↓
+                         request.json + context.json
 ```
 
 #### Conversation and State
 
-每次运行以 system prompt 和自然语言目标作为初始消息。后续每一轮都会把完整的 `messages` 列表发送给模型，再将模型回复和工具执行结果依次追加到列表中，因此对话上下文采用只追加、不裁剪的全量历史模式。工程还会保留 Kimi/DashScope 返回的 `reasoning_content`，并在后续请求中原样回放，以维持推理连续性。
+每次运行仍以 system prompt 和自然语言目标作为固定锚点。模型回复与工具结果继续只追加到内存 `messages` 和 `messages.jsonl`，但网络请求不再回放全部历史。Harness 将 assistant 消息及其后续 tool result 或 correction user 消息视为一个不可拆分的回合组，从最新位置向前最多保留 4 组；若序列化后的近期消息超过 24,000 字符，则从最旧组开始整体移除。这样不会产生缺少 `tool_calls` 来源的孤立 tool result。Kimi/DashScope 的 `reasoning_content` 会随被保留的 assistant 回合一起回放。
 
-与此同时，Harness 使用独立的 `state` 状态机记录运行阶段、研究计划、baseline、当前及最佳配置、实验指标、待处理与历史实验、失败与回滚事件，以及各类预算。该状态是实验流程的权威数据；LLM 不能直接修改，只能通过受控工具触发状态迁移。完整的 `state` 不会在每轮重新注入模型，模型主要通过已有对话和工具结果掌握当前进展。
+与此同时，Harness 在每轮调用前从 `state` 生成 `schema_version=1` 的权威摘要，覆盖运行阶段、迭代进度、计划状态、完整当前/最佳配置、最佳指标、待决实验、最近实验结果、精简后的最近工具观察、完成条件、失败和实时剩余预算。最近工具观察会剔除文件正文、日志尾部和大型文件列表，只保留结果、路径、哈希、指标、下一动作及省略体积；即使一个超大回合被窗口整体移除，模型仍能获知该工具是否成功。摘要作为请求末尾的临时 user JSON 消息注入，并明确声明旧消息与摘要冲突时以摘要为准。该派生消息不进入完整 `messages.jsonl`，LLM 也不能直接修改权威状态，只能通过受控工具触发状态迁移。
 
 #### Persistence and Traceability
 
@@ -245,15 +248,33 @@ LLM 回复 → 工具调用 → 工具结果
 - `state.json`：最新的结构化运行状态；
 - `trajectory.jsonl`：工具调用、决策、错误、恢复和后续动作；
 - `llm_calls/call_XXX/`：每轮发送的完整请求和模型原始响应；
+- `llm_calls/call_XXX/context.json`：该轮摘要、保留/省略回合数、字符用量和消息数量；
 - `tool_calls/call_XXX_<tool>/`：工具参数及执行结果。
 
-这些记录支持复盘、审计和故障定位，但目前尚未提供从 `state.json` 和 `messages.jsonl` 自动恢复中断任务的入口；重新调用 `run_agent()` 会创建新的运行目录和上下文。
+`request.json` 表示模型实际看到的精简上下文，`messages.jsonl` 表示未裁剪的完整交互，两者由 `context.json` 中的构造元数据连接。这些记录支持复盘、审计和故障定位，但目前尚未提供从 `state.json` 和 `messages.jsonl` 自动恢复中断任务的入口；重新调用 `run_agent()` 仍会创建新的运行目录和上下文。历史运行 `research_agent_003` 生成于该机制引入之前，因此其旧产物没有 `context.json`，实验指标不受本次上下文改造影响。
 
 #### Context Growth and Limitations
 
-工程通过限制单次工具结果来减缓上下文增长：文件读取默认最多 500 行、返回最多 12,000 字符，文件列表最多 200 项，实验命令只向模型返回 stdout 和 stderr 的末尾片段。最多 40 次工具调用、5 次候选实验和 30 分钟运行时间也会间接限制上下文规模。
+工程同时限制单次观察与累计近期历史：文件读取默认最多 500 行、返回最多 12,000 字符，文件列表最多 200 项，实验命令只返回 stdout/stderr 尾部；模型请求最多保留近期 4 个完整回合且这些回合合计不超过 24,000 字符。`context.enabled=false` 可恢复原有全量请求行为，用于兼容或诊断。
 
-当前实现只读取并显示接口返回的 `total_tokens`，尚未建立独立的 token/context 预算，也没有请求前 token 估算、历史摘要或滑动窗口、旧工具输出淘汰、上下文超限专项恢复及跨进程断点续跑。因此，该方案透明、易审计，适合当前短流程实验 Agent；若扩展到更长任务，应优先增加 token 预算监控、分层摘要和持久化恢复机制。
+当前窗口按 JSON 序列化字符数计量，并不等价于模型 tokenizer 的精确 token 预算；固定 system prompt、原始目标、工具 schemas 和状态摘要也不计入 `max_recent_chars`。系统仍没有请求前 token 估算、上下文超限专项恢复或跨进程断点续跑。对于更长任务，下一步应增加模型感知的 token 预算、摘要体积上限和持久化恢复机制。
+
+#### Post-Implementation Comparison
+
+为评估改造效果，将启用完整历史的 `research_agent_003` 与启用权威摘要和滑动窗口的 `context_control_001` 对齐到“Iteration 1 已接受”阶段。两次运行的 baseline `mean_score` 均为 5.20；token 统计来自各轮 `response.json` 的 API usage，仅累计成功响应。
+
+| 指标 | 优化前 | 优化后 | 变化 |
+|---|---:|---:|---:|
+| 到达该阶段的成功 LLM 调用 | 17 | 19 | +2 |
+| 累计输入 token | 248,855 | 121,842 | **-51.0%** |
+| 累计输出 token | 5,918 | 9,515 | +60.8% |
+| 累计 total token | 254,773 | 131,357 | **-48.4%** |
+| Iteration 1 `mean_score` | 10.47 | **18.96** | **+81.1%** |
+| Iteration 1 `mean_reward` | 218.29 | **459.66** | **+110.6%** |
+
+在产生 Iteration 1 评估决定的单轮请求中，输入量从 26,057 token 降至 7,116 token，降幅为 **72.7%**；优化后的请求只包含 11 条消息、最近 4 个完整回合，并省略 14 个较早回合。旧运行完成 5 个候选后共使用 1,012,192 total token，最佳 `mean_score` 为 14.31；新运行在第 1 个候选、累计 131,357 token 时已观察到 18.96。因此，本次运行同时表现出更低的上下文成本和更高的早期搜索效率。
+
+该比较不是严格的因果 A/B 实验。两次 Iteration 1 使用了不同候选配置，且都只使用 `seed=0`；新运行还出现了重复计划、非法参数和命令超时等工具纠错，最终因 DashScope 返回余额不足的 429 错误而在 Iteration 1 后中止，未完成全部实验、回滚证据和最终报告。由此可以确认上下文压缩显著降低了 token 增长，但实验分数提升仍需通过相同候选、多随机种子和多次完整运行进一步验证。原始证据见 [`research_agent_003/state.json`](runs/research_agent_003/state.json)、[`context_control_001/state.json`](runs/context_control_001/state.json) 及两次运行的 `llm_calls/` 目录。
  
 ### Plan–Act–Observe–Validate Loop
 
@@ -319,7 +340,7 @@ LLM 使用 `evaluate_result` 提交 `accept` 或 `rollback` 以及理由和证�
 
 持久化记录支持三个层次的追踪：
 
-1. **重建模型视角：** `messages.jsonl` 和每轮 `request.json` 可回答“模型当时看到了什么”；
+1. **重建模型视角：** `request.json` 可回答模型实际看到了什么，`context.json` 解释其摘要和裁剪过程，`messages.jsonl` 则保留完整未裁剪交互；
 2. **重建系统动作：** `trajectory.jsonl` 与工具目录可回答“调用了什么、返回了什么”；
 3. **重建实验事实：** baseline/iteration 下的配置、metrics、execution、日志和 Q-table 可回答“实际运行产生了什么”。
 
@@ -349,7 +370,7 @@ LLM 使用 `evaluate_result` 提交 `accept` 或 `rollback` 以及理由和证�
 python -m unittest discover -s tests -v
 ```
 
-共 8 项测试全部通过。覆盖内容包括：原生工具调用解析与 Kimi 推理字段回放、OpenAI SDK 参数、进度 heartbeat 与内容防泄漏、配置最低要求、独立执行/指标比较、报告证据校验、越界写入和提前结束拒绝，以及包含 baseline、3 次 candidate 和真实回滚的端到端状态机。该测试结果支持控制逻辑按预期工作，但不等价于证明所有操作系统、模型 provider 或长时间故障模式均已覆盖。
+共 12 项测试全部通过。覆盖内容包括：原生工具调用解析与 Kimi 推理字段回放、上下文配置校验、权威状态摘要、assistant/tool 原子窗口、最近工具大载荷压缩与禁用兼容模式、OpenAI SDK 参数、进度 heartbeat 与内容防泄漏、配置最低要求、独立执行/指标比较、报告证据校验、越界写入和提前结束拒绝，以及包含 baseline、3 次 candidate、真实回滚和裁剪审计的端到端状态机。该测试结果支持控制逻辑按预期工作，但不等价于证明所有操作系统、模型 provider 或长时间故障模式均已覆盖。
  
 ### Rollback and Recovery Mechanism
 
@@ -511,7 +532,8 @@ call 39  finish                             → completed / agent_finish
 
 #### Context and Durability
 
-- 每轮将完整消息历史重新发送给模型，没有 token 预算、摘要、滑动窗口或上下文超限恢复；
+- 已实现权威状态摘要和字符预算滑动窗口，但 24,000 字符只是 token 用量的近似代理，且状态摘要本身尚无独立体积上限；
+- 窗口最多保留 4 个近期回合，较早的源代码观察和研究理由可能被移出请求；当前摘要保存事实状态，但不替代长期语义记忆；
 - `messages.jsonl`、`state.json` 和每轮请求虽可审计，但 `run_agent()` 没有从已有记录恢复中断运行的入口；
 - `state.json` 使用普通覆盖写而非临时文件加原子替换，极端掉电或进程中止可能留下部分写入；
 - 运行记录会保存完整 prompt、模型回复和工具返回。虽然 API key 不落盘，公开分享 run 目录前仍应进行内容与隐私审查。
@@ -533,7 +555,7 @@ call 39  finish                             → completed / agent_finish
 3. **增强实验设计。** 将多参数候选拆成消融实验，或使用受预算约束的贝叶斯优化/逐次淘汰，同时保持 Harness 对候选合法性和最终指标的独立验证。
 4. **记录完整环境。** 每次 run 自动写入源码 commit、dirty-worktree 标记、Python/依赖版本、平台和硬件摘要；提供 lockfile 或容器配置，使协议复现升级为环境复现。
 5. **实现可恢复状态机。** 使用原子文件替换保存状态，为每轮建立一致性 checkpoint，并支持从 `state.json + messages.jsonl` 恢复；恢复时验证最后一条 tool call、`pending_run` 和磁盘产物是否一致。
-6. **管理长上下文。** 在请求前估算 token，保留近期消息和不可丢失状态摘要，将历史工具输出压缩为带文件引用的结构化证据，并对 context-length error 提供恢复路径。
+6. **深化长上下文管理。** 在现有权威摘要与字符窗口之上增加模型 tokenizer 估算、摘要体积上限和 context-length error 恢复；将被淘汰的研究理由压缩为带文件引用的长期语义记忆。
 7. **强化报告校验。** 从 `state.json` 自动生成结果表和关键数字，或让报告中的机器可读 front matter 与状态逐字段比对；自然语言只负责解释，不手工复制核心指标。
 8. **加强隔离与资源控制。** 将实验放入容器或低权限进程，增加 CPU、内存、磁盘和子进程树限制；对公开产物执行自动密钥与隐私扫描。
 9. **扩展故障测试。** 增加超时、损坏 metrics、丢失快照、状态写入中断、API 连续失败、上下文超限和跨平台路径等故障注入测试。
@@ -543,7 +565,7 @@ call 39  finish                             → completed / agent_finish
 
 Mini AutoResearch Agent 展示了一个边界清晰的自主实验实现：LLM 负责计划与研究判断，Python Harness 负责真实执行、约束、验证和证据持久化。其价值不在于让模型拥有无限执行权限，而在于把模型的开放式推理嵌入一个可拒绝、可恢复、可审计的确定性状态机。
 
-唯一完成且通过全部完成条件的 `research_agent_003` 在固定 seed 和评估协议下，将 Flappy Bird Q-learning 的 `mean_score` 从 5.20 提高到 14.31，并对两个合法但退化的候选执行了经过验证的快照回滚。现有 8 项自动测试全部通过，支持核心控制逻辑的正确性。与此同时，单 seed、高方差、指标聚合缺陷、上下文线性增长、缺少断点恢复和环境锁定等问题限制了结论强度。
+唯一完成且通过全部完成条件的 `research_agent_003` 在固定 seed 和评估协议下，将 Flappy Bird Q-learning 的 `mean_score` 从 5.20 提高到 14.31，并对两个合法但退化的候选执行了经过验证的快照回滚。现有 12 项自动测试全部通过，支持核心控制逻辑以及新增权威摘要/滑动窗口机制的正确性。与此同时，单 seed、高方差、指标聚合缺陷、缺少精确 token 预算与断点恢复、环境锁定不足等问题仍限制结论强度。
 
 因此，当前系统已经达到“小规模、受控、可审计的自主实验原型”水平，但若用于更长时间、更高成本或公开基准比较，应先完成指标修复、多种子统计验证、环境固化、原子恢复和更强隔离。本文的最佳结果应被理解为一次完整运行中的最佳已观测结果，而不是未经限定的算法性能声明。
 
